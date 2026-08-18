@@ -22,7 +22,37 @@ API docs:
 https://sugartopia-backend-673387630043.asia-east1.run.app/docs
 ```
 
-## Main API
+## Main APIs
+
+Shop list:
+
+```text
+GET /api/shops
+```
+
+Example:
+
+```text
+GET /api/shops?q=matcha&location=songshan
+```
+
+Response:
+
+```json
+{
+  "total": 1,
+  "shops": [
+    {
+      "id": "matcha-mori-house",
+      "name": "Matcha Mori House",
+      "category": "Japanese Dessert",
+      "location": "Songshan, Taipei"
+    }
+  ]
+}
+```
+
+AI chat:
 
 ```text
 POST /api/chat

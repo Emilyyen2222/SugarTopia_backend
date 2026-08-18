@@ -228,7 +228,13 @@ CORS 可以先理解成「瀏覽器的跨網址安全檢查」。
 ```python
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["https://sugar-topia.vercel.app"],
+    allow_origins=[
+        "https://sugar-topia.vercel.app",
+        "http://127.0.0.1:5501",
+        "http://localhost:5501",
+        "http://127.0.0.1:5500",
+        "http://localhost:5500",
+    ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -248,6 +254,83 @@ allow_origins=["*"]
 ```
 
 這代表允許所有網站呼叫，比較方便測試，但正式部署時比較不精準。現在已經改成只允許 SugarTopia 的 Vercel 網址。
+
+目前也保留了本機測試網址：
+
+```text
+http://127.0.0.1:5501
+http://localhost:5501
+http://127.0.0.1:5500
+http://localhost:5500
+```
+
+這是因為前端本機開發時可能會用 VS Code Live Server 或 `npm run dev` 開在這些 port。
+
+## 為什麼先做 `/api/shops`
+
+在直接串 Google Maps 之前，先做自己的店家資料 API：
+
+```text
+GET /api/shops
+```
+
+原因是這一步可以先練習真正的前後端資料流：
+
+```text
+前端 category.html
+  ↓ fetch
+後端 GET /api/shops
+  ↓
+回傳店家 JSON
+  ↓
+前端渲染列表和篩選結果
+```
+
+這樣做完後，前端就不需要只靠 `Js/site-data.js` 裡的本機假資料。
+
+目前 `/api/shops` 回傳的是 `dessert_data_sample.json` 裡整理過的 demo 店家資料。這些資料還不是真正資料庫，也不是 Google Maps 的即時資料。
+
+之後要接 Google Maps 時，可以把資料來源慢慢換成：
+
+```text
+Google Places API 查到的店家資料
++ SugarTopia 自己整理的分類、標籤、推薦文字
++ 使用者自己的評論和收藏
+```
+
+所以 `/api/shops` 可以理解成未來資料庫或 Google Maps 的前置練習版。
+
+目前 `/api/shops` 支援簡單查詢：
+
+```text
+GET /api/shops
+GET /api/shops?q=matcha
+GET /api/shops?location=songshan
+GET /api/shops?q=matcha&location=songshan
+```
+
+回傳格式大概是：
+
+```json
+{
+  "total": 1,
+  "shops": [
+    {
+      "id": "matcha-mori-house",
+      "name": "Matcha Mori House",
+      "nameZh": "抹茶森之屋",
+      "category": "Japanese Dessert",
+      "categoryZh": "日式甜點",
+      "location": "Songshan, Taipei",
+      "locationZh": "松山區",
+      "rating": 4.8,
+      "reviews": "1.2k reviews",
+      "tags": ["Matcha", "Quiet", "Work Friendly", "Limited Time"],
+      "description": "A calm dessert shop known for matcha mille crepe, hojicha pudding, and seats with outlets."
+    }
+  ]
+}
+```
 
 ## 目前使用的後端框架
 

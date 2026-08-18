@@ -18,6 +18,7 @@ GEMINI_EMBEDDING_MODEL = os.getenv("GEMINI_EMBEDDING_MODEL", "models/gemini-embe
 vector_db = None
 llm = None
 startup_error = None
+shops = []
 
 def format_model_content(content):
     if isinstance(content, str):
@@ -37,6 +38,53 @@ def format_model_content(content):
 
     return str(content)
 
+def read_shop_data():
+    with open("dessert_data_sample.json", "r", encoding="utf-8") as f:
+        return json.load(f)
+
+def normalize_shop(item):
+    return {
+        "id": item.get("id", item["name"]),
+        "name": item["name_en"],
+        "nameZh": item["name"],
+        "category": item["category_en"],
+        "categoryZh": item["category"],
+        "location": item["location_en"],
+        "locationZh": item["location"],
+        "rating": item.get("rating", 0),
+        "reviews": item.get("review_count", f"{len(item.get('reviews', []))} reviews"),
+        "tags": item.get("tags_en", item.get("tags", [])),
+        "tagsZh": item.get("tags", []),
+        "image": item.get("image", ""),
+        "description": item.get("description_en", item.get("description", "")),
+        "descriptionZh": item.get("description", ""),
+        "comments": item.get("reviews", []),
+    }
+
+def get_search_text(shop):
+    values = [
+        shop["name"],
+        shop["nameZh"],
+        shop["category"],
+        shop["categoryZh"],
+        shop["location"],
+        shop["locationZh"],
+        shop["description"],
+        shop["descriptionZh"],
+        " ".join(shop["tags"]),
+        " ".join(shop["tagsZh"]),
+        " ".join(shop["comments"]),
+    ]
+    return " ".join(values).lower()
+
+try:
+    dessert_data = read_shop_data()
+    shops = [normalize_shop(item) for item in dessert_data]
+except Exception as e:
+    dessert_data = []
+    startup_error = f"資料讀取失敗：{e}"
+    print(f"❌ {startup_error}")
+
 try:
     if not GOOGLE_API_KEY:
         raise RuntimeError(
@@ -48,12 +96,18 @@ try:
 
     # 2. 讀取 dessert_data_sample.json 資料
     try:
-        with open('dessert_data_sample.json', 'r', encoding='utf-8') as f:
-            dessert_data = json.load(f)
-
         documents = []
         for item in dessert_data:
-            content = f"店名：{item['name']}\n分類：{item['category']}\n地點：{item['location']}\n特色標籤：{', '.join(item['tags'])}\n評論：{' '.join(item['reviews'])}"
+            content = (
+                f"店名：{item['name']}\n"
+                f"英文名稱：{item['name_en']}\n"
+                f"分類：{item['category']}\n"
+                f"地點：{item['location']}\n"
+                f"評分：{item.get('rating', '暫無評分')}\n"
+                f"特色標籤：{', '.join(item['tags'])}\n"
+                f"介紹：{item.get('description', '')}\n"
+                f"評論：{' '.join(item['reviews'])}"
+            )
             documents.append(Document(page_content=content))
 
         # 3. 建立 Chroma 向量資料庫
@@ -72,7 +126,13 @@ app = FastAPI()
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["https://sugar-topia.vercel.app"],
+    allow_origins=[
+        "https://sugar-topia.vercel.app",
+        "http://127.0.0.1:5501",
+        "http://localhost:5501",
+        "http://127.0.0.1:5500",
+        "http://localhost:5500",
+    ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -94,6 +154,27 @@ def health_check():
     return {
         "status": "ok" if vector_db is not None and llm is not None else "error",
         "detail": startup_error,
+    }
+
+@app.get("/api/shops")
+def get_shops(q: str = "", location: str = "", category: str = ""):
+    query = q.lower().strip()
+    place = location.lower().strip()
+    shop_category = category.lower().strip()
+
+    results = []
+    for shop in shops:
+        search_text = get_search_text(shop)
+        matches_query = not query or query in search_text
+        matches_location = not place or place in search_text
+        matches_category = not shop_category or shop_category in search_text
+
+        if matches_query and matches_location and matches_category:
+            results.append(shop)
+
+    return {
+        "total": len(results),
+        "shops": results,
     }
 
 @app.post("/api/chat")
