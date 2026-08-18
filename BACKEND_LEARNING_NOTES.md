@@ -332,6 +332,108 @@ GET /api/shops?q=matcha&location=songshan
 }
 ```
 
+## AI 問答混合模式
+
+這一階段不是重新串 Gemini，因為 Gemini 已經可以用了。
+
+這一階段是在 `/api/chat` 裡加上「問題分類」和「不同回答規則」。
+
+原本的模式比較像：
+
+```text
+使用者問問題
+  ↓
+後端只搜尋 SugarTopia 資料
+  ↓
+資料有就回答
+  ↓
+資料沒有就說沒有資料
+```
+
+這樣的好處是安全，不容易亂編店家；缺點是資料少時，很多甜點相關問題也會回答得太死。
+
+現在改成混合模式：
+
+```text
+甜點店推薦問題
+  → 優先根據 SugarTopia 資料推薦店家
+
+甜點知識問題
+  → Gemini 可以用一般甜點知識回答
+
+無關問題
+  → 禮貌引導回甜點推薦
+```
+
+目前問題分類寫在 `main.py` 的 `classify_question()`：
+
+```python
+def classify_question(message):
+    ...
+```
+
+它會把問題分成：
+
+```text
+shop_recommendation
+dessert_knowledge
+out_of_scope
+```
+
+例如：
+
+```text
+我想吃抹茶甜點
+```
+
+會被當成：
+
+```text
+shop_recommendation
+```
+
+這種問題會優先根據 SugarTopia 店家資料回答。
+
+```text
+布丁是什麼？
+起司蛋糕怎麼選？
+可麗露和瑪德蓮差在哪？
+```
+
+會被當成：
+
+```text
+dessert_knowledge
+```
+
+這種問題可以用 Gemini 的一般甜點知識回答，不需要資料庫裡剛好有一間店。
+
+```text
+股票怎麼買？
+今天政治新聞是什麼？
+```
+
+會被當成：
+
+```text
+out_of_scope
+```
+
+這種問題不會丟給 Gemini 延伸回答，而是直接提醒使用者 SugarTopia 主要處理甜點推薦。
+
+重要規則：
+
+```text
+Gemini 可以回答甜點知識
+但不可以編造 SugarTopia 沒有收錄的店家
+```
+
+這樣可以兼顧：
+
+1. 推薦店家時不要亂編。
+2. 甜點常識問題不要太死板。
+3. 讓 SugarTopia 保持自己的產品定位。
+
 ## 目前使用的後端框架
 
 這個專案目前已經有後端框架，使用的是：
