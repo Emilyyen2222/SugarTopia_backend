@@ -9,14 +9,15 @@
     "location_en": "Songshan, Taipei",
     "rating": 4.8,
     "review_count": "1.2k reviews",
-    "tags": ["抹茶", "安靜", "有插座", "適合工作", "不限時"],
-    "tags_en": ["Matcha", "Quiet", "Work Friendly", "Limited Time"],
+    "tags": ["抹茶", "布丁", "焙茶", "安靜", "有插座", "適合工作", "不限時"],
+    "tags_en": ["Matcha", "Pudding", "Hojicha", "Quiet", "Work Friendly", "Limited Time"],
     "image": "img/lp.jpg",
     "description": "安靜的日式甜點店，主打抹茶千層、焙茶布丁與適合工作的插座座位。",
     "description_en": "A calm dessert shop known for matcha mille crepe, hojicha pudding, and seats with outlets.",
     "reviews": [
       "環境非常安靜，很適合帶筆電來工作整天。",
-      "抹茶千層蛋糕必點，座位都有附插座很貼心。"
+      "抹茶千層蛋糕必點，座位都有附插座很貼心。",
+      "焙茶布丁茶香濃郁，口感滑順，很適合不想吃太甜的人。"
     ]
   },
   {
@@ -97,6 +98,26 @@
     "reviews": [
       "帶狗狗來很自在，座位間距舒服。",
       "蛋糕和咖啡都穩定，週末早午餐氣氛很好。"
+    ]
+  },
+  {
+    "id": "caramel-pudding-lab",
+    "name": "焦糖布丁研究室",
+    "name_en": "Caramel Pudding Lab",
+    "category": "布丁甜點",
+    "category_en": "Puddings",
+    "location": "大安區",
+    "location_en": "Da'an, Taipei",
+    "rating": 4.7,
+    "review_count": "610 reviews",
+    "tags": ["布丁", "焦糖", "手作甜點", "下午茶", "安靜"],
+    "tags_en": ["Pudding", "Caramel", "Handmade Dessert", "Afternoon Tea", "Quiet"],
+    "image": "img/theo-crazzolara-BpcTCHoruSo-unsplash.jpg",
+    "description": "主打手作焦糖布丁、伯爵茶布丁與季節水果布丁，口感滑順，甜度溫和。",
+    "description_en": "A pudding-focused dessert shop serving caramel pudding, earl grey pudding, and seasonal fruit puddings.",
+    "reviews": [
+      "焦糖布丁香氣很深，苦甜味剛好，不會膩。",
+      "伯爵茶布丁很滑順，茶香明顯，下午茶時間很適合來一份。"
     ]
   },
   {

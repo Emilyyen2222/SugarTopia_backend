@@ -186,8 +186,8 @@ def chat_with_gemini(request: ChatRequest):
         )
 
     try:
-        # A. 搜尋最相關的 2 筆甜點資料
-        search_results = vector_db.similarity_search(request.message, k=2)
+        # A. 搜尋最相關的甜點資料
+        search_results = vector_db.similarity_search(request.message, k=min(4, len(dessert_data)))
         
         # B. 整理 Context
         context = ""
@@ -197,7 +197,9 @@ def chat_with_gemini(request: ChatRequest):
         # C. 組合專屬 Prompt
         prompt = f"""
         你是一個專業的台北甜點推薦助手。請嚴格根據以下【參考資料】來回答使用者的問題。
-        如果參考資料中沒有相關資訊，請直接回答「抱歉，目前的資料庫中沒有找到相關的甜點資訊。」，絕對不可以自己隨機編造資料庫以外的店家。
+        如果參考資料中有符合使用者需求的店家，請直接推薦 1 到 2 間，並說明推薦原因。
+        如果只有部分符合，也可以清楚說明「目前資料中最接近的是...」。
+        如果參考資料中完全沒有相關資訊，請直接回答「抱歉，目前的資料庫中沒有找到相關的甜點資訊。」，絕對不可以自己隨機編造資料庫以外的店家。
         請用自然段落或簡短條列回答，不要使用 Markdown 格式符號，例如 **、###、```。
 
         【參考資料】:
