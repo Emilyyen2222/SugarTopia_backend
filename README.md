@@ -562,6 +562,36 @@ dessert_data_sample.json
 
 範例設定檔。給自己或別人看需要哪些環境變數，但裡面不放真的 key。
 
+```text
+requirements.txt
+```
+
+後端部署時需要安裝的 Python 套件清單。
+
+```text
+Dockerfile
+```
+
+Cloud Run 部署時用來建立後端執行環境的設定檔。
+
+```text
+.dockerignore
+```
+
+告訴 Cloud Run 部署時不要上傳哪些本機檔案，例如 `.env`、`venv/`、`__pycache__/`。
+
+```text
+.gcloudignore
+```
+
+告訴 `gcloud run deploy --source .` 不要把本機檔案打包上傳，例如 `.env`、`venv/`、`__pycache__/`。這個很重要，因為 Cloud Run 從原始碼部署時會先把整個資料夾壓成 zip 上傳。
+
+```text
+.gitignore
+```
+
+告訴 Git 不要追蹤哪些本機檔案，例如 `.env`、`venv/`、`__pycache__/`。
+
 ## 第一次設定 API key
 
 如果還沒有 `.env`，先在專案資料夾執行：
@@ -656,6 +686,210 @@ http://127.0.0.1:8000/docs
 ```
 
 這個頁面可以直接在瀏覽器裡測試 `/api/chat`。
+
+## 後端 GitHub 備份流程
+
+後端目前已經推到 GitHub：
+
+```text
+https://github.com/Emilyyen2222/SugarTopia_backend
+```
+
+第一次建立後端 repo 時用過的流程：
+
+```bash
+cd /Users/mike/Documents/emily_project_archive/SugarTopia_backend
+git init
+git add main.py dessert_data_sample.json README.md .env.example requirements.txt Dockerfile .dockerignore
+git commit -m "Prepare FastAPI backend for Cloud Run"
+git branch -M master
+git remote add origin https://github.com/Emilyyen2222/SugarTopia_backend.git
+git push -u origin master
+```
+
+注意：
+
+```text
+.env 不要上傳
+venv/ 不要上傳
+__pycache__/ 不要上傳
+```
+
+如果看到這個錯誤：
+
+```text
+Permission to Emilyyen2222/SugarTopia_backend.git denied to EmilyChen0320
+```
+
+代表目前電腦 GitHub 認到的是公司帳號 `EmilyChen0320`，但 repo 是個人帳號 `Emilyyen2222` 的。可以先用 GitHub repo 的 Settings -> Collaborators，把 `EmilyChen0320` 加成 collaborator，接受邀請後再 push。
+
+之後一般更新流程：
+
+```bash
+git status
+git add 檔案名稱
+git commit -m "更新說明"
+git push
+```
+
+如果只是看到 `.env` 或 `__pycache__/` 出現在 changes，通常不需要上傳；這些已經被 `.gitignore` 忽略。
+
+## Google Cloud CLI 安裝與登入
+
+Mac 可以用 Homebrew 安裝 Google Cloud CLI：
+
+```bash
+brew update
+brew install --cask gcloud-cli
+```
+
+安裝後重新開一個 terminal，確認是否安裝成功：
+
+```bash
+gcloud --version
+```
+
+登入並選擇 Google Cloud 專案：
+
+```bash
+gcloud init
+```
+
+目前使用的 Google Cloud 專案 ID：
+
+```text
+project-06b353aa-b188-498b-ab0
+```
+
+如果 `gcloud init` 問要選哪個 project，選這個專案。
+
+## 部署到 Google Cloud Run
+
+部署前要確認後端有這些檔案：
+
+```text
+main.py
+dessert_data_sample.json
+requirements.txt
+Dockerfile
+.dockerignore
+.gcloudignore
+```
+
+部署指令：
+
+```bash
+cd /Users/mike/Documents/emily_project_archive/SugarTopia_backend
+
+gcloud run deploy sugartopia-backend \
+  --project=project-06b353aa-b188-498b-ab0 \
+  --source . \
+  --region asia-east1 \
+  --allow-unauthenticated
+```
+
+第一次部署時，如果 Google 問要不要啟用 Cloud Run、Cloud Build、Artifact Registry 等 API，輸入：
+
+```bash
+y
+```
+
+如果 Google 問要不要建立 Artifact Registry repository，例如 `cloud-run-source-deploy`，也輸入：
+
+```bash
+y
+```
+
+部署成功後，終端機會出現 `Service URL`，通常會長得像：
+
+```text
+https://sugartopia-backend-xxxxx-xx.a.run.app
+```
+
+這個網址就是正式後端網址。之後前端要把原本的：
+
+```text
+http://127.0.0.1:8000/api/chat
+```
+
+改成：
+
+```text
+https://你的-cloud-run-service-url/api/chat
+```
+
+## Cloud Run 環境變數
+
+Cloud Run 不會使用本機 `.env`，所以部署後要在 Cloud Run 服務裡設定環境變數。
+
+需要設定：
+
+```env
+GOOGLE_API_KEY=你的 Gemini API key
+GEMINI_MODEL=gemini-3.6-flash
+GEMINI_EMBEDDING_MODEL=models/gemini-embedding-001
+```
+
+`.env` 只給本機開發使用；Cloud Run 上要用 Google Cloud 後台的環境變數。
+
+## Cloud Run IAM 權限錯誤
+
+如果部署時看到類似：
+
+```text
+PERMISSION_DENIED: Build failed because the default service account is missing required IAM permissions
+673387630043-compute@developer.gserviceaccount.com
+```
+
+意思是 Cloud Run 要幫你 build 後端時，預設服務帳號缺少權限。
+
+處理方式是補上 `Cloud Run Builder` 權限：
+
+```bash
+gcloud projects add-iam-policy-binding project-06b353aa-b188-498b-ab0 \
+  --member=serviceAccount:673387630043-compute@developer.gserviceaccount.com \
+  --role=roles/run.builder
+```
+
+跑完後等 1 到 2 分鐘，再重新部署一次：
+
+```bash
+gcloud run deploy sugartopia-backend \
+  --project=project-06b353aa-b188-498b-ab0 \
+  --source . \
+  --region asia-east1 \
+  --allow-unauthenticated
+```
+
+## Cloud Run Build 套件版本錯誤
+
+如果部署時看到：
+
+```text
+ERROR: Could not find a version that satisfies the requirement numpy==2.5.1
+```
+
+原因是 Dockerfile 原本用的是：
+
+```dockerfile
+FROM python:3.11-slim
+```
+
+但本機 `requirements.txt` 是從 Python 3.13 的 venv 產生的，其中 `numpy==2.5.1` 需要 Python 3.12 以上。
+
+處理方式是把 Dockerfile 改成：
+
+```dockerfile
+FROM python:3.13-slim
+```
+
+另外，如果 build log 裡看到 Cloud Build 正在解壓縮 `/workspace/venv/`，代表本機虛擬環境被一起上傳了。這時需要新增 `.gcloudignore`，排除：
+
+```text
+venv/
+.env
+__pycache__/
+```
 
 ## 今天遇到的錯誤紀錄
 
