@@ -106,6 +106,9 @@ def classify_question(message):
     has_knowledge_signal = any(keyword in text for keyword in knowledge_keywords)
     has_unrealistic_request = any(keyword in text for keyword in unrealistic_request_keywords)
 
+    if has_unrealistic_request and has_dessert_signal:
+        return "shop_recommendation"
+
     if has_unrealistic_request:
         return "out_of_scope"
 
@@ -119,6 +122,15 @@ def classify_question(message):
         return "shop_recommendation"
 
     return "out_of_scope"
+
+def includes_unrealistic_request(message):
+    text = message.lower().strip()
+    unrealistic_request_keywords = [
+        "請讓我", "讓我跟", "見面", "約出來", "幫我約", "變成", "扮演",
+        "生成圖片", "產生圖片", "畫一張", "幫我畫", "make me meet",
+        "meet with", "roleplay", "draw", "generate image",
+    ]
+    return any(keyword in text for keyword in unrealistic_request_keywords)
 
 def format_documents(docs):
     if not docs:
@@ -279,6 +291,14 @@ def chat_with_gemini(request: ChatRequest):
             如果參考資料中完全沒有相關店家，請不要編造不存在的店家，可以改給甜點選擇建議，並說明目前 SugarTopia 資料還沒有收錄完全符合的店家。
             """
 
+        boundary_instruction = ""
+        if includes_unrealistic_request(request.message):
+            boundary_instruction = """
+            使用者的問題中包含 SugarTopia 做不到的要求，例如安排和特定人物見面、約出來、角色扮演或生成圖片。
+            請用一句話溫和說明你不能完成那個部分，但不要整題拒絕。
+            接著只針對問題裡和甜點、下午茶、咖啡廳、地點、心情或用餐情境有關的部分回答。
+            """
+
         prompt = f"""
         你是 SugarTopia 的甜點推薦助手，熟悉台北甜點店、甜點種類、咖啡廳情境與用餐需求。
 
@@ -287,6 +307,7 @@ def chat_with_gemini(request: ChatRequest):
 
         【回答規則】:
         {task_instruction}
+        {boundary_instruction}
 
         不可以編造 SugarTopia 參考資料以外的店家名稱。
         可以回答甜點相關常識，但若提到店家推薦，必須來自 SugarTopia 參考資料。
