@@ -1,9 +1,14 @@
 from fastapi import FastAPI
 from fastapi import HTTPException
+from fastapi import Header
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
+import bcrypt
+from datetime import datetime, timedelta, timezone
 import json
 import os
+import secrets
+import sqlite3
 from dotenv import load_dotenv
 from langchain_google_genai import GoogleGenerativeAIEmbeddings, ChatGoogleGenerativeAI
 from langchain_community.vectorstores import Chroma
@@ -14,11 +19,116 @@ load_dotenv()
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY") or os.getenv("GEMINI_API_KEY")
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.6-flash")
 GEMINI_EMBEDDING_MODEL = os.getenv("GEMINI_EMBEDDING_MODEL", "models/gemini-embedding-001")
+DATABASE_PATH = os.getenv("DATABASE_PATH", "sugartopia_app.db")
+SESSION_HOURS = 24 * 7
 
 vector_db = None
 llm = None
 startup_error = None
 shops = []
+
+def get_db_connection():
+    conn = sqlite3.connect(DATABASE_PATH)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+def init_app_database():
+    with get_db_connection() as conn:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS users (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL,
+                email TEXT NOT NULL UNIQUE,
+                password_hash TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS sessions (
+                token TEXT PRIMARY KEY,
+                user_id INTEGER NOT NULL,
+                expires_at TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                FOREIGN KEY (user_id) REFERENCES users(id)
+            )
+        """)
+        conn.commit()
+
+def serialize_user(row):
+    return {
+        "id": row["id"],
+        "name": row["name"],
+        "email": row["email"],
+        "createdAt": row["created_at"],
+    }
+
+def hash_password(password):
+    return bcrypt.hashpw(password.encode("utf-8"), bcrypt.gensalt()).decode("utf-8")
+
+def verify_password(password, password_hash):
+    return bcrypt.checkpw(password.encode("utf-8"), password_hash.encode("utf-8"))
+
+def create_session(user_id):
+    token = secrets.token_urlsafe(32)
+    now = datetime.now(timezone.utc)
+    expires_at = now + timedelta(hours=SESSION_HOURS)
+
+    with get_db_connection() as conn:
+        conn.execute(
+            """
+            INSERT INTO sessions (token, user_id, expires_at, created_at)
+            VALUES (?, ?, ?, ?)
+            """,
+            (token, user_id, expires_at.isoformat(), now.isoformat()),
+        )
+        conn.commit()
+
+    return {
+        "token": token,
+        "expiresAt": expires_at.isoformat(),
+    }
+
+def get_bearer_token(authorization):
+    if not authorization:
+        raise HTTPException(status_code=401, detail="Missing Authorization header.")
+
+    prefix = "Bearer "
+    if not authorization.startswith(prefix):
+        raise HTTPException(status_code=401, detail="Invalid Authorization header.")
+
+    return authorization[len(prefix):].strip()
+
+def get_current_user_from_token(token):
+    now = datetime.now(timezone.utc).isoformat()
+
+    with get_db_connection() as conn:
+        row = conn.execute(
+            """
+            SELECT users.id, users.name, users.email, users.created_at, sessions.expires_at
+            FROM sessions
+            JOIN users ON users.id = sessions.user_id
+            WHERE sessions.token = ?
+            """,
+            (token,),
+        ).fetchone()
+
+        if row is None:
+            raise HTTPException(status_code=401, detail="Session not found.")
+
+        if row["expires_at"] <= now:
+            conn.execute("DELETE FROM sessions WHERE token = ?", (token,))
+            conn.commit()
+            raise HTTPException(status_code=401, detail="Session expired.")
+
+        return row
+
+def normalize_email(email):
+    normalized = email.strip().lower()
+
+    if "@" not in normalized or "." not in normalized.split("@")[-1]:
+        raise HTTPException(status_code=400, detail="Please enter a valid email.")
+
+    return normalized
 
 def format_model_content(content):
     if isinstance(content, str):
@@ -163,6 +273,13 @@ except Exception as e:
     print(f"❌ {startup_error}")
 
 try:
+    init_app_database()
+    print("✅ SugarTopia 會員資料庫準備完成！")
+except Exception as e:
+    startup_error = f"會員資料庫初始化失敗：{e}"
+    print(f"❌ {startup_error}")
+
+try:
     if not GOOGLE_API_KEY:
         raise RuntimeError(
             "Missing Google Gemini API key. Set GOOGLE_API_KEY or GEMINI_API_KEY in your environment."
@@ -207,8 +324,12 @@ app.add_middleware(
         "https://sugar-topia.vercel.app",
         "http://127.0.0.1:5501",
         "http://localhost:5501",
+        "http://[::]:5501",
+        "http://[::1]:5501",
         "http://127.0.0.1:5500",
         "http://localhost:5500",
+        "http://[::]:5500",
+        "http://[::1]:5500",
     ],
     allow_credentials=True,
     allow_methods=["*"],
@@ -217,6 +338,15 @@ app.add_middleware(
 
 class ChatRequest(BaseModel):
     message: str
+
+class SignupRequest(BaseModel):
+    name: str
+    email: str
+    password: str
+
+class LoginRequest(BaseModel):
+    email: str
+    password: str
 
 @app.get("/")
 def read_root():
@@ -231,6 +361,88 @@ def health_check():
     return {
         "status": "ok" if vector_db is not None and llm is not None else "error",
         "detail": startup_error,
+    }
+
+@app.post("/api/auth/signup")
+def signup(request: SignupRequest):
+    name = request.name.strip()
+    email = normalize_email(request.email)
+    password = request.password
+
+    if len(name) < 2:
+        raise HTTPException(status_code=400, detail="Name must be at least 2 characters.")
+
+    if len(password) < 8:
+        raise HTTPException(status_code=400, detail="Password must be at least 8 characters.")
+
+    now = datetime.now(timezone.utc).isoformat()
+
+    try:
+        with get_db_connection() as conn:
+            cursor = conn.execute(
+                """
+                INSERT INTO users (name, email, password_hash, created_at)
+                VALUES (?, ?, ?, ?)
+                """,
+                (name, email, hash_password(password), now),
+            )
+            conn.commit()
+            user_id = cursor.lastrowid
+            user = conn.execute(
+                "SELECT id, name, email, created_at FROM users WHERE id = ?",
+                (user_id,),
+            ).fetchone()
+    except sqlite3.IntegrityError:
+        raise HTTPException(status_code=409, detail="This email is already registered.")
+
+    session = create_session(user_id)
+
+    return {
+        "user": serialize_user(user),
+        "token": session["token"],
+        "expiresAt": session["expiresAt"],
+    }
+
+@app.post("/api/auth/login")
+def login(request: LoginRequest):
+    email = normalize_email(request.email)
+
+    with get_db_connection() as conn:
+        user = conn.execute(
+            "SELECT id, name, email, password_hash, created_at FROM users WHERE email = ?",
+            (email,),
+        ).fetchone()
+
+    if user is None or not verify_password(request.password, user["password_hash"]):
+        raise HTTPException(status_code=401, detail="Email or password is incorrect.")
+
+    session = create_session(user["id"])
+
+    return {
+        "user": serialize_user(user),
+        "token": session["token"],
+        "expiresAt": session["expiresAt"],
+    }
+
+@app.get("/api/auth/me")
+def get_me(authorization: str = Header(default="")):
+    token = get_bearer_token(authorization)
+    user = get_current_user_from_token(token)
+
+    return {
+        "user": serialize_user(user),
+    }
+
+@app.post("/api/auth/logout")
+def logout(authorization: str = Header(default="")):
+    token = get_bearer_token(authorization)
+
+    with get_db_connection() as conn:
+        conn.execute("DELETE FROM sessions WHERE token = ?", (token,))
+        conn.commit()
+
+    return {
+        "message": "Logged out successfully.",
     }
 
 @app.get("/api/shops")

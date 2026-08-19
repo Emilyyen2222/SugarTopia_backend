@@ -6,3 +6,5 @@ __pycache__/
 *.pyc
 .DS_Store
 PROJECT_ROADMAP.md
+sugartopia_app.db
+sugartopia_app.db-*

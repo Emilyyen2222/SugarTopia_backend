@@ -6,3 +6,5 @@ __pycache__/
 *.pyc
 .DS_Store
 .git/
+sugartopia_app.db
+sugartopia_app.db-*
