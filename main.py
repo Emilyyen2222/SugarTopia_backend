@@ -85,6 +85,11 @@ def classify_question(message):
         "python", "javascript", "vue", "程式", "履歷", "面試",
         "stock", "weather", "politics", "election", "crypto", "bitcoin",
     ]
+    unrealistic_request_keywords = [
+        "請讓我", "讓我跟", "見面", "約出來", "幫我約", "變成", "扮演",
+        "生成圖片", "產生圖片", "畫一張", "幫我畫", "make me meet",
+        "meet with", "roleplay", "draw", "generate image",
+    ]
     dessert_keywords = [
         "甜點", "蛋糕", "布丁", "抹茶", "咖啡", "咖啡廳", "下午茶", "冰淇淋",
         "可麗露", "肉桂捲", "貝果", "舒芙蕾", "乳酪", "起司", "巧克力",
@@ -99,6 +104,10 @@ def classify_question(message):
 
     has_dessert_signal = any(keyword in text for keyword in dessert_keywords)
     has_knowledge_signal = any(keyword in text for keyword in knowledge_keywords)
+    has_unrealistic_request = any(keyword in text for keyword in unrealistic_request_keywords)
+
+    if has_unrealistic_request:
+        return "out_of_scope"
 
     if any(keyword in text for keyword in out_of_scope_keywords) and not has_dessert_signal:
         return "out_of_scope"
@@ -120,6 +129,18 @@ def format_documents(docs):
         context += f"\n--- 參考資料 {i+1} ---\n{doc.page_content}\n"
 
     return context
+
+def get_public_ai_error(error):
+    error_text = str(error)
+    print(f"❌ Gemini request failed: {error_text}")
+
+    if "429" in error_text or "RESOURCE_EXHAUSTED" in error_text or "quota" in error_text.lower():
+        return "SugarTopia AI 目前使用量已達上限，請晚一點再試。"
+
+    if "API key" in error_text or "INVALID_ARGUMENT" in error_text:
+        return "SugarTopia AI 目前設定需要檢查，請稍後再試。"
+
+    return "SugarTopia AI 目前有點忙，請稍後再試。"
 
 try:
     dessert_data = read_shop_data()
@@ -234,7 +255,8 @@ def chat_with_gemini(request: ChatRequest):
 
         if question_type == "out_of_scope":
             return {
-                "reply": "我是 SugarTopia 甜點推薦助手，主要可以幫你找甜點店、咖啡廳、甜點種類介紹，或依照地區和情境推薦店家。你可以問我：想吃抹茶甜點、想找適合工作的咖啡廳，或布丁和奶酪有什麼差別。"
+                "reply": "我是 SugarTopia 甜點推薦助手，主要可以幫你找甜點店、咖啡廳、甜點種類介紹，或依照地區和情境推薦店家。你可以問我：想吃抹茶甜點、想找適合工作的咖啡廳，或布丁和奶酪有什麼差別。",
+                "type": question_type,
             }
 
         search_results = []
@@ -284,4 +306,7 @@ def chat_with_gemini(request: ChatRequest):
             "type": question_type,
         }
     except Exception as e:
-        return {"error": str(e)}
+        return {
+            "reply": get_public_ai_error(e),
+            "type": "error",
+        }

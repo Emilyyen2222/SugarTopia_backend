@@ -434,6 +434,57 @@ Gemini 可以回答甜點知識
 2. 甜點常識問題不要太死板。
 3. 讓 SugarTopia 保持自己的產品定位。
 
+## Gemini 429 / quota exceeded 是什麼？
+
+如果畫面出現類似：
+
+```text
+429 RESOURCE_EXHAUSTED
+You exceeded your current quota
+Quota exceeded for metric: generate_content_free
+```
+
+意思是 Gemini API 的免費額度或短時間呼叫限制被用完了。
+
+這不是前端壞掉，也不是 Cloud Run 壞掉，而是 Gemini 暫時拒絕繼續產生回答。
+
+目前每次使用首頁 AI 問答，大致會消耗：
+
+```text
+一次 Cloud Run request
++ 一次 Gemini API 呼叫
+```
+
+如果問題被判斷成：
+
+```text
+out_of_scope
+```
+
+後端會直接回固定文字，不會呼叫 Gemini，所以不會消耗 Gemini token。
+
+為了避免使用者看到很長的技術錯誤，`main.py` 裡有 `get_public_ai_error()`：
+
+```python
+def get_public_ai_error(error):
+    ...
+```
+
+它會把 Gemini 原始錯誤轉成比較友善的文字，例如：
+
+```text
+SugarTopia AI 目前使用量已達上限，請晚一點再試。
+```
+
+後端 console 還是會印出簡短錯誤，方便開發時排查，但前端不會直接顯示整段 raw error。
+
+之後可以再加：
+
+1. Rate limit：限制同一個使用者短時間內不能一直問。
+2. 每日使用量上限：避免測試時不小心花太多額度。
+3. 預算提醒：在 Google Cloud 設 budget alert。
+4. 前端更清楚的錯誤 UI，例如顯示「今日 AI 使用量暫時達上限」。
+
 ## 目前使用的後端框架
 
 這個專案目前已經有後端框架，使用的是：
