@@ -103,11 +103,3 @@ GEMINI_EMBEDDING_MODEL=models/gemini-embedding-001
 ```
 
 Do not commit `.env`.
-
-## Learning Notes
-
-Backend setup notes, deployment commands, error records, and beginner-friendly explanations are in:
-
-```text
-BACKEND_LEARNING_NOTES.md
-```
