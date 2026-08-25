@@ -10,7 +10,8 @@ import os
 import re
 import requests
 import secrets
-import sqlite3
+import psycopg2
+import psycopg2.extras
 from dotenv import load_dotenv
 from langchain_google_genai import GoogleGenerativeAIEmbeddings, ChatGoogleGenerativeAI
 from langchain_community.vectorstores import Chroma
@@ -25,24 +26,58 @@ GEMINI_EMBEDDING_MODEL = os.getenv("GEMINI_EMBEDDING_MODEL", "models/gemini-embe
 # GOOGLE_API_KEY 分開，避免混用（兩個是不同的 Google Cloud 服務、不同的計費）。
 GOOGLE_PLACES_API_KEY = os.getenv("GOOGLE_PLACES_API_KEY")
 GOOGLE_PLACES_BASE_URL = "https://places.googleapis.com/v1"
-DATABASE_PATH = os.getenv("DATABASE_PATH", "sugartopia_app.db")
+# 原本用 SQLite，資料庫是容器裡的一個檔案——但 Cloud Run 沒有持久化磁碟，
+# 容器只要重啟（重新部署、或閒置太久被自動回收）裡面的檔案就會全部消失，
+# 這也是之前店家/評論資料一直不見的原因。改用 Supabase 代管的 PostgreSQL，
+# 資料庫獨立於 Cloud Run 之外，容器重啟不會再影響到資料。
+DATABASE_URL = os.getenv("DATABASE_URL")
 SESSION_HOURS = 24 * 7
 
 vector_db = None
 llm = None
 startup_error = None
 shops = []
+vector_document_count = 0
+
+# 這個小 wrapper 讓程式碼其餘部分（conn.execute(...)、row["欄位名稱"]、
+# with get_db_connection() as conn: 這些寫法）幾乎不用改，把底層從
+# sqlite3 換成 psycopg2 時只集中改這裡：
+# - SQLite 用 "?" 佔位符，Postgres 用 "%s"，這裡自動轉換。
+# - 用 RealDictCursor 讓每一列資料表現得像 dict，跟原本 sqlite3.Row 的
+#   row["col"] 用法相容。
+# - with 區塊結束時沒有例外就自動 commit，有例外就 rollback，並且真的把
+#   連線關掉（sqlite3 原本的 with 只會 commit/rollback，不會關閉連線；
+#   Postgres 連線數有限，用完一定要關）。
+class DBConnection:
+    def __init__(self, pg_conn):
+        self._conn = pg_conn
+
+    def execute(self, sql, params=()):
+        cursor = self._conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        cursor.execute(sql.replace("?", "%s"), params)
+        return cursor
+
+    def commit(self):
+        self._conn.commit()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        if exc_type is None:
+            self._conn.commit()
+        else:
+            self._conn.rollback()
+        self._conn.close()
 
 def get_db_connection():
-    conn = sqlite3.connect(DATABASE_PATH)
-    conn.row_factory = sqlite3.Row
-    return conn
+    return DBConnection(psycopg2.connect(DATABASE_URL))
 
 def init_app_database():
     with get_db_connection() as conn:
         conn.execute("""
             CREATE TABLE IF NOT EXISTS users (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                id SERIAL PRIMARY KEY,
                 name TEXT NOT NULL,
                 email TEXT NOT NULL UNIQUE,
                 password_hash TEXT NOT NULL,
@@ -60,7 +95,7 @@ def init_app_database():
         """)
         conn.execute("""
             CREATE TABLE IF NOT EXISTS favorites (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                id SERIAL PRIMARY KEY,
                 user_id INTEGER NOT NULL,
                 shop_id TEXT NOT NULL,
                 created_at TEXT NOT NULL,
@@ -70,7 +105,7 @@ def init_app_database():
         """)
         conn.execute("""
             CREATE TABLE IF NOT EXISTS reviews (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                id SERIAL PRIMARY KEY,
                 user_id INTEGER NOT NULL,
                 shop_id TEXT NOT NULL,
                 rating INTEGER NOT NULL,
@@ -101,18 +136,6 @@ def init_app_database():
                 created_at TEXT NOT NULL
             )
         """)
-
-        # curated_shops 這張表在加上 lat/lng 之前就已經存在，SQLite 的
-        # CREATE TABLE IF NOT EXISTS 不會回頭幫舊表補新欄位，所以這裡手動檢查、
-        # 缺就用 ALTER TABLE 補上，讓已經收錄過的店家舊資料不會壞掉。
-        existing_columns = {
-            row["name"] for row in conn.execute("PRAGMA table_info(curated_shops)").fetchall()
-        }
-        if "lat" not in existing_columns:
-            conn.execute("ALTER TABLE curated_shops ADD COLUMN lat REAL")
-        if "lng" not in existing_columns:
-            conn.execute("ALTER TABLE curated_shops ADD COLUMN lng REAL")
-
         conn.commit()
 
 def serialize_user(row):
@@ -456,7 +479,7 @@ try:
     # 1. 建立 Embedding 模型
     embeddings = GoogleGenerativeAIEmbeddings(model=GEMINI_EMBEDDING_MODEL, google_api_key=GOOGLE_API_KEY)
 
-    # 2. 讀取 dessert_data_sample.json 資料
+    # 2. 讀取 dessert_data_sample.json 資料（7 家示意店家）
     try:
         documents = []
         for item in dessert_data:
@@ -472,9 +495,31 @@ try:
             )
             documents.append(Document(page_content=content))
 
+        # 2.5 curated_shops（Google Places 收錄的真實店家）也一起餵進向量
+        # 資料庫，AI 才會知道這批真實店家存在。欄位跟示意資料不完全一樣
+        # （curated_shops 沒有逐則評論文字，description 常常是空的——
+        # admin_places.html 收錄流程目前沒有補這欄），格式盡量比照上面
+        # 示意資料的寫法，缺的欄位用友善的預設文字頂著，不留空白段落。
+        # 只在開機時讀取一次，之後新收錄的店家要等下次重新部署/重啟才會
+        # 被 AI 問答認識到，不是即時更新——這個限制先記錄，之後有需要
+        # 再改成即時重建索引。
+        for item in curated_shops:
+            content = (
+                f"店名：{item['nameZh'] or item['name']}\n"
+                f"英文名稱：{item['name']}\n"
+                f"分類：{item['categoryZh'] or item['category'] or '尚未分類'}\n"
+                f"地點：{item['locationZh'] or item['location'] or '台北'}\n"
+                f"評分：{item['rating'] if item['rating'] else '暫無評分'}\n"
+                f"特色標籤：{', '.join(item['tagsZh'] or item['tags']) or '暫無標籤'}\n"
+                f"介紹：{item['description'] or 'Google Places 收錄的真實台北店家，目前沒有額外的文字介紹。'}\n"
+                f"資料來源：Google Places 收錄的真實店家"
+            )
+            documents.append(Document(page_content=content))
+
         # 3. 建立 Chroma 向量資料庫
         vector_db = Chroma.from_documents(documents, embeddings)
-        print("✅ 甜點資料庫載入成功！")
+        vector_document_count = len(documents)
+        print(f"✅ 甜點資料庫載入成功！（{len(dessert_data)} 家示意店家 + {len(curated_shops)} 家 Google Places 真實店家）")
     except Exception as e:
         raise RuntimeError(f"資料庫載入失敗，請確認檔案與 Gemini API key 是否正確。錯誤: {e}") from e
 
@@ -555,7 +600,7 @@ def health_check():
     return {
         "status": "ok" if vector_db is not None and llm is not None else "error",
         "detail": startup_error,
-        "database": os.path.basename(DATABASE_PATH),
+        "database": "postgres" if DATABASE_URL else "not configured",
     }
 
 @app.post("/api/auth/signup")
@@ -578,16 +623,17 @@ def signup(request: SignupRequest):
                 """
                 INSERT INTO users (name, email, password_hash, created_at)
                 VALUES (?, ?, ?, ?)
+                RETURNING id
                 """,
                 (name, email, hash_password(password), now),
             )
+            user_id = cursor.fetchone()["id"]
             conn.commit()
-            user_id = cursor.lastrowid
             user = conn.execute(
                 "SELECT id, name, email, created_at FROM users WHERE id = ?",
                 (user_id,),
             ).fetchone()
-    except sqlite3.IntegrityError:
+    except psycopg2.errors.UniqueViolation:
         raise HTTPException(status_code=409, detail="This email is already registered.")
 
     session = create_session(user_id)
@@ -767,11 +813,12 @@ def add_shop_review(shop_id: str, request: ReviewRequest, authorization: str = H
             """
             INSERT INTO reviews (user_id, shop_id, rating, review_text, created_at)
             VALUES (?, ?, ?, ?, ?)
+            RETURNING id
             """,
             (user["id"], shop_id, request.rating, review_text, now),
         )
+        review_id = cursor.fetchone()["id"]
         conn.commit()
-        review_id = cursor.lastrowid
         row = conn.execute(
             """
             SELECT reviews.id, reviews.shop_id, reviews.rating, reviews.review_text, reviews.created_at, users.name
@@ -990,7 +1037,7 @@ def chat_with_gemini(request: ChatRequest):
 
         search_results = []
         if question_type == "shop_recommendation":
-            search_results = vector_db.similarity_search(request.message, k=min(4, len(dessert_data)))
+            search_results = vector_db.similarity_search(request.message, k=min(4, vector_document_count))
 
         context = format_documents(search_results)
 

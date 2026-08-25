@@ -76,6 +76,7 @@ overrides==7.7.0
 packaging==26.3
 propcache==0.5.2
 proto-plus==1.28.2
+psycopg2-binary==2.9.10
 protobuf==5.29.6
 pyasn1==0.6.4
 pyasn1_modules==0.4.2
