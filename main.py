@@ -549,12 +549,18 @@ app.add_middleware(
         "http://localhost:5500",
         "http://[::]:5500",
         "http://[::1]:5500",
-        # SugarTopia_nuxt（Nuxt 重構版）本機開發用的 port，Nuxt 預設跑在
-        # 3000。這個新前端還在遷移中，跟 vanilla 版本共用同一個後端。
+        # SugarTopia_nuxt（Nuxt 重構版）本機開發用的 port。Nuxt 預設跑在
+        # 3000，但那個 port 跟開發者本機的公司專案衝突，所以本機開發改用
+        # 4000（仍保留 3000 這幾條，避免哪天又有人在別台機器上用預設 port
+        # 開，不用因為這條規則被卡住）。
         "http://127.0.0.1:3000",
         "http://localhost:3000",
         "http://[::]:3000",
         "http://[::1]:3000",
+        "http://127.0.0.1:4000",
+        "http://localhost:4000",
+        "http://[::]:4000",
+        "http://[::1]:4000",
     ],
     allow_credentials=True,
     allow_methods=["*"],
@@ -852,6 +858,7 @@ def get_latest_reviews(limit: int = 8):
         review = serialize_review(row)
         shop = find_shop(row["shop_id"])
         review["shopName"] = shop["name"] if shop else row["shop_id"]
+        review["shopNameZh"] = shop["nameZh"] if shop else row["shop_id"]
         review["shopImage"] = shop["image"] if shop else ""
         review_list.append(review)
 
