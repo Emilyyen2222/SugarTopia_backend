@@ -26,6 +26,13 @@ GEMINI_EMBEDDING_MODEL = os.getenv("GEMINI_EMBEDDING_MODEL", "models/gemini-embe
 # GOOGLE_API_KEY 分開，避免混用（兩個是不同的 Google Cloud 服務、不同的計費）。
 GOOGLE_PLACES_API_KEY = os.getenv("GOOGLE_PLACES_API_KEY")
 GOOGLE_PLACES_BASE_URL = "https://places.googleapis.com/v1"
+# 收錄店家用的 admin 頁面／API（搜尋 Google Places、把結果寫進 curated_shops）
+# 只讓這裡列出的 email 用——比對前先轉小寫、去頭尾空白，設定環境變數時
+# 不用糾結大小寫或多打的空格。逗號分隔可以放多個 email，例如以後要多開一個
+# 帳號給別人協助收錄。沒有設定這個環境變數的話（本機沒設、忘記在 Cloud Run
+# 設），這幾支 API 會直接全部擋掉，不會「沒設定就等於誰都能用」這種故障
+# 開放（fail-open）的預設值。
+ADMIN_EMAILS = {email.strip().lower() for email in os.getenv("ADMIN_EMAILS", "").split(",") if email.strip()}
 # 原本用 SQLite，資料庫是容器裡的一個檔案——但 Cloud Run 沒有持久化磁碟，
 # 容器只要重啟（重新部署、或閒置太久被自動回收）裡面的檔案就會全部消失，
 # 這也是之前店家/評論資料一直不見的原因。改用 Supabase 代管的 PostgreSQL，
@@ -209,6 +216,18 @@ def get_current_user_from_token(token):
 def require_current_user(authorization):
     token = get_bearer_token(authorization)
     return get_current_user_from_token(token)
+
+def require_admin_user(authorization):
+    # 先確認有登入（跟其他需要登入的 API 一樣），登入之後再多檢查一層：
+    # email 有沒有在 ADMIN_EMAILS 白名單裡。不是白名單就當作一般已登入
+    # 使用者，回 403（跟沒登入的 401 分開，方便前端分辨是「請登入」還是
+    # 「登入了但沒有權限」）。
+    user = require_current_user(authorization)
+
+    if user["email"].strip().lower() not in ADMIN_EMAILS:
+        raise HTTPException(status_code=403, detail="This account does not have admin access.")
+
+    return user
 
 def normalize_email(email):
     normalized = email.strip().lower()
@@ -868,7 +887,9 @@ def get_latest_reviews(limit: int = 8):
     }
 
 @app.get("/api/google/places/search")
-def search_google_places(q: str = ""):
+def search_google_places(q: str = "", authorization: str = Header(default="")):
+    require_admin_user(authorization)
+
     if not GOOGLE_PLACES_API_KEY:
         raise HTTPException(status_code=503, detail="Google Places API key is not configured.")
 
@@ -904,7 +925,9 @@ def search_google_places(q: str = ""):
     }
 
 @app.get("/api/google/places/{place_id}")
-def get_google_place(place_id: str):
+def get_google_place(place_id: str, authorization: str = Header(default="")):
+    require_admin_user(authorization)
+
     if not GOOGLE_PLACES_API_KEY:
         raise HTTPException(status_code=503, detail="Google Places API key is not configured.")
 
@@ -933,7 +956,9 @@ def get_google_place(place_id: str):
     return serialize_google_place_details(response.json())
 
 @app.post("/api/shops/curated")
-def add_curated_shop(request: CuratedShopRequest):
+def add_curated_shop(request: CuratedShopRequest, authorization: str = Header(default="")):
+    require_admin_user(authorization)
+
     if not GOOGLE_PLACES_API_KEY:
         raise HTTPException(status_code=503, detail="Google Places API key is not configured.")
 
