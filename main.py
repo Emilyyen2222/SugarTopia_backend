@@ -1,6 +1,7 @@
 from fastapi import FastAPI
 from fastapi import HTTPException
 from fastapi import Header
+from fastapi import Response
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import bcrypt
@@ -10,6 +11,7 @@ import os
 import re
 import requests
 import secrets
+from urllib.parse import quote
 import psycopg2
 import psycopg2.extras
 from dotenv import load_dotenv
@@ -26,6 +28,12 @@ GEMINI_EMBEDDING_MODEL = os.getenv("GEMINI_EMBEDDING_MODEL", "models/gemini-embe
 # GOOGLE_API_KEY 分開，避免混用（兩個是不同的 Google Cloud 服務、不同的計費）。
 GOOGLE_PLACES_API_KEY = os.getenv("GOOGLE_PLACES_API_KEY")
 GOOGLE_PLACES_BASE_URL = "https://places.googleapis.com/v1"
+# 存進 curated_shops 的 image 欄位需要是一個完整網址（前端 resolveShopImage()
+# 看到 http/https 開頭就直接原樣使用，不會再幫忙補 host）——因為圖片是靠
+# /api/places/photo 這支後端自己的路由代理出去的（見下面），跟前端不同
+# origin（Vercel／Cloud Run），存相對路徑會變成去前端自己的網域找圖，404。
+# 本機開發預設用本機網址，正式環境要記得在 Cloud Run 設這個環境變數。
+PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "http://127.0.0.1:8000")
 # 收錄店家用的 admin 頁面／API（搜尋 Google Places、把結果寫進 curated_shops）
 # 只讓這裡列出的 email 用——比對前先轉小寫、去頭尾空白，設定環境變數時
 # 不用糾結大小寫或多打的空格。逗號分隔可以放多個 email，例如以後要多開一個
@@ -955,6 +963,43 @@ def get_google_place(place_id: str, authorization: str = Header(default="")):
 
     return serialize_google_place_details(response.json())
 
+# curated_shops 的 image 欄位存的是「/api/places/photo?name=...」這種指到
+# 自己這支路由的網址（見 add_curated_shop() 怎麼組出這個網址），不是
+# Google 原始的照片網址。原因：Google Places 的照片要帶 API key 才能存取，
+# 如果直接把 Google 的照片網址（帶 key）存進資料庫、讓前端 <img src> 直接
+# 指過去，等於把後端的 API key 整個曝光在瀏覽器看得到的網頁原始碼裡，
+# 任何人都能複製去用、算在你的 Google 帳單額度裡。改成這支後端自己的路由
+# 幫忙代理：前端只看得到這支路由的網址，真正帶 key 去跟 Google 要照片、
+# 再把照片內容原封不動轉給前端的動作，都在後端做，key 不會外流。
+#
+# 沒有掛 require_admin_user：這支路由本身不會新增/修改任何資料，只是把
+# 「本來就已經透過 GET /api/shops 公開給所有人看」的店家照片轉出去，跟
+# 站內其他公開圖片（/img/*.jpg 這些）是同一個開放程度，不用額外限制。
+@app.get("/api/places/photo")
+def get_places_photo(name: str, max_width: int = 800):
+    if not GOOGLE_PLACES_API_KEY:
+        raise HTTPException(status_code=503, detail="Google Places API key is not configured.")
+
+    try:
+        response = requests.get(
+            f"{GOOGLE_PLACES_BASE_URL}/{name}/media",
+            params={"maxWidthPx": max_width, "key": GOOGLE_PLACES_API_KEY},
+            timeout=10,
+        )
+    except requests.RequestException:
+        raise HTTPException(status_code=502, detail="Could not reach Google Places API.")
+
+    if not response.ok:
+        raise HTTPException(status_code=502, detail="Could not load photo from Google Places.")
+
+    return Response(
+        content=response.content,
+        media_type=response.headers.get("Content-Type", "image/jpeg"),
+        # 瀏覽器／CDN 快取一天：店家照片幾乎不會變，沒必要每次都重新跟
+        # Google 要一次（Google Places Photo API 本身也是有配額限制的）。
+        headers={"Cache-Control": "public, max-age=86400"},
+    )
+
 @app.post("/api/shops/curated")
 def add_curated_shop(request: CuratedShopRequest, authorization: str = Header(default="")):
     require_admin_user(authorization)
@@ -985,7 +1030,7 @@ def add_curated_shop(request: CuratedShopRequest, authorization: str = Header(de
                 "X-Goog-Api-Key": GOOGLE_PLACES_API_KEY,
                 "X-Goog-FieldMask": (
                     "id,displayName,formattedAddress,rating,userRatingCount,"
-                    "googleMapsUri,location"
+                    "googleMapsUri,location,photos"
                 ),
             },
             timeout=10,
@@ -1003,6 +1048,16 @@ def add_curated_shop(request: CuratedShopRequest, authorization: str = Header(de
     name = place.get("displayName", {}).get("text", "").strip()
     if not name:
         raise HTTPException(status_code=502, detail="Google did not return a shop name.")
+
+    # 只拿第一張照片（Google 通常會回好幾張，這裡不用全部收，一張封面
+    # 照就夠了，跟現有 7 家示意店家一家一張圖是同一個做法）。photos[i].name
+    # 是 Google 那邊的照片資源路徑（例如 "places/ABC/photos/XYZ"），不是
+    # 可以直接用的網址，要透過 /api/places/photo 這支自己的路由代理出去
+    # （原因見那支路由的註解——直接存 Google 的照片網址會外流 API key）。
+    photos = place.get("photos", [])
+    image_url = ""
+    if photos and photos[0].get("name"):
+        image_url = f"{PUBLIC_BASE_URL}/api/places/photo?name={quote(photos[0]['name'], safe='')}"
 
     location = place.get("location", {})
     shop_id = f"{slugify(name)}-{place_id[-6:].lower()}"
@@ -1032,7 +1087,7 @@ def add_curated_shop(request: CuratedShopRequest, authorization: str = Header(de
                 json.dumps(request.tags, ensure_ascii=False),
                 json.dumps(request.tags_zh, ensure_ascii=False),
                 "",
-                "",
+                image_url,
                 location.get("latitude"),
                 location.get("longitude"),
                 place_id,
