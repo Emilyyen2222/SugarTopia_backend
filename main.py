@@ -368,6 +368,10 @@ def serialize_review(row):
         "text": row["review_text"],
         "createdAt": row["created_at"],
         "reviewerName": row["name"],
+        # 前端要知道「這則評論是不是我自己寫的」才能決定要不要顯示編輯／
+        # 刪除按鈕，不能只靠「有沒有登入」判斷（登入了也不該能刪別人的
+        # 評論的按鈕，雖然後端本來就會擋，但按鈕不該一開始就顯示出來）。
+        "userId": row["user_id"],
     }
 
 def serialize_google_place(place):
@@ -809,7 +813,7 @@ def get_shop_reviews(shop_id: str):
     with get_db_connection() as conn:
         rows = conn.execute(
             """
-            SELECT reviews.id, reviews.shop_id, reviews.rating, reviews.review_text, reviews.created_at, users.name
+            SELECT reviews.id, reviews.shop_id, reviews.rating, reviews.review_text, reviews.created_at, reviews.user_id, users.name
             FROM reviews
             JOIN users ON users.id = reviews.user_id
             WHERE reviews.shop_id = ?
@@ -854,7 +858,7 @@ def add_shop_review(shop_id: str, request: ReviewRequest, authorization: str = H
         conn.commit()
         row = conn.execute(
             """
-            SELECT reviews.id, reviews.shop_id, reviews.rating, reviews.review_text, reviews.created_at, users.name
+            SELECT reviews.id, reviews.shop_id, reviews.rating, reviews.review_text, reviews.created_at, reviews.user_id, users.name
             FROM reviews
             JOIN users ON users.id = reviews.user_id
             WHERE reviews.id = ?
@@ -864,6 +868,68 @@ def add_shop_review(shop_id: str, request: ReviewRequest, authorization: str = H
 
     return serialize_review(row)
 
+@app.put("/api/reviews/{review_id}")
+def update_review(review_id: int, request: ReviewRequest, authorization: str = Header(default="")):
+    user = require_current_user(authorization)
+
+    if request.rating < 1 or request.rating > 5:
+        raise HTTPException(status_code=400, detail="Rating must be between 1 and 5.")
+
+    review_text = request.text.strip()
+    if len(review_text) < 2:
+        raise HTTPException(status_code=400, detail="Review text is too short.")
+
+    with get_db_connection() as conn:
+        existing = conn.execute("SELECT user_id FROM reviews WHERE id = ?", (review_id,)).fetchone()
+
+        if existing is None:
+            raise HTTPException(status_code=404, detail="Review not found.")
+
+        # 只有原作者能改自己的評論，不看是不是登入就能改任何一則——跟收藏
+        # 的 DELETE FROM favorites WHERE user_id = ? AND shop_id = ? 是同一個
+        # 「WHERE 條件裡帶上 user_id，靠資料庫本身擋掉別人的資料」的做法，
+        # 但這裡多了 review_text／rating 這種使用者自己輸入的內容，光靠
+        # WHERE 條件式的 UPDATE 静默失敗（改到 0 筆）不夠清楚，所以先查一次
+        # 現有資料的 user_id，不是自己的就明確擋掉、回 403，而不是讓請求
+        # 看起來「成功」但其實什麼都沒改到。
+        if existing["user_id"] != user["id"]:
+            raise HTTPException(status_code=403, detail="You can only edit your own reviews.")
+
+        conn.execute(
+            "UPDATE reviews SET rating = ?, review_text = ? WHERE id = ?",
+            (request.rating, review_text, review_id),
+        )
+        conn.commit()
+        row = conn.execute(
+            """
+            SELECT reviews.id, reviews.shop_id, reviews.rating, reviews.review_text, reviews.created_at, reviews.user_id, users.name
+            FROM reviews
+            JOIN users ON users.id = reviews.user_id
+            WHERE reviews.id = ?
+            """,
+            (review_id,),
+        ).fetchone()
+
+    return serialize_review(row)
+
+@app.delete("/api/reviews/{review_id}")
+def delete_review(review_id: int, authorization: str = Header(default="")):
+    user = require_current_user(authorization)
+
+    with get_db_connection() as conn:
+        existing = conn.execute("SELECT user_id FROM reviews WHERE id = ?", (review_id,)).fetchone()
+
+        if existing is None:
+            raise HTTPException(status_code=404, detail="Review not found.")
+
+        if existing["user_id"] != user["id"]:
+            raise HTTPException(status_code=403, detail="You can only delete your own reviews.")
+
+        conn.execute("DELETE FROM reviews WHERE id = ?", (review_id,))
+        conn.commit()
+
+    return {"message": "Review deleted.", "reviewId": review_id}
+
 @app.get("/api/reviews/latest")
 def get_latest_reviews(limit: int = 8):
     capped_limit = max(1, min(limit, 20))
@@ -871,7 +937,7 @@ def get_latest_reviews(limit: int = 8):
     with get_db_connection() as conn:
         rows = conn.execute(
             """
-            SELECT reviews.id, reviews.shop_id, reviews.rating, reviews.review_text, reviews.created_at, users.name
+            SELECT reviews.id, reviews.shop_id, reviews.rating, reviews.review_text, reviews.created_at, reviews.user_id, users.name
             FROM reviews
             JOIN users ON users.id = reviews.user_id
             ORDER BY reviews.created_at DESC
