@@ -129,6 +129,14 @@ def init_app_database():
                 FOREIGN KEY (user_id) REFERENCES users(id)
             )
         """)
+        # reviews 表在正式環境已經有真實資料了，CREATE TABLE IF NOT EXISTS
+        # 不會幫已存在的表補新欄位——這裡另外用 ALTER TABLE ADD COLUMN IF
+        # NOT EXISTS 補上 context_tags（Phase 4「情境式心得」用），
+        # IF NOT EXISTS 讓這行每次開機都能安全重複執行，不會因為欄位已經
+        # 存在就噴錯。
+        conn.execute("""
+            ALTER TABLE reviews ADD COLUMN IF NOT EXISTS context_tags TEXT NOT NULL DEFAULT '[]'
+        """)
         conn.execute("""
             CREATE TABLE IF NOT EXISTS curated_shops (
                 id TEXT PRIMARY KEY,
@@ -372,6 +380,7 @@ def serialize_review(row):
         # 刪除按鈕，不能只靠「有沒有登入」判斷（登入了也不該能刪別人的
         # 評論的按鈕，雖然後端本來就會擋，但按鈕不該一開始就顯示出來）。
         "userId": row["user_id"],
+        "contextTags": json.loads(row["context_tags"] or "[]"),
     }
 
 def serialize_google_place(place):
@@ -624,6 +633,26 @@ class FavoriteRequest(BaseModel):
 class ReviewRequest(BaseModel):
     rating: int
     text: str
+    # 情境標籤（Phase 4「情境式心得」）：使用者寫評論時順手複選幾個符合
+    # 這次體驗的情境（適合工作、安靜、有插座……），非必填、預設空陣列。
+    # 故意跟店家本身的 tags 用同一套「字串陣列」格式，不是另外設計一套
+    # 結構——之後要做「AI 從評論內容自動長標籤」時，這批使用者自己選的
+    # 標籤跟 AI 長出來的標籤才能直接合併，不用再做一次格式轉換。
+    context_tags: list[str] = []
+
+# 情境標籤固定字典，跟前端 write-review.vue 的選項一一對應。固定字典而
+# 不是讓使用者自己打字：一方面避免亂七八糟的自由字串污染標籤池（拼字
+# 不一致、語言混雜），另一方面這批標籤之後要真的拿去做篩選/搜尋比對，
+# 選項必須是可控、可預期的固定集合才有用。
+REVIEW_CONTEXT_TAGS = {
+    "Work Friendly", "Quiet", "Outlets", "Solo Friendly", "Instagrammable", "Long Wait",
+}
+
+def clean_context_tags(tags):
+    # 只留字典裡有的值，其餘（不管是打字打錯、還是有人直接打 API 亂塞）
+    # 都直接丟掉，不回錯誤——寫評論的人不需要知道有這個字典存在，安靜
+    # 過濾掉就好，不用因為傳了奇怪的值就擋掉整篇評論。
+    return sorted({tag for tag in tags if tag in REVIEW_CONTEXT_TAGS})
 
 class CuratedShopRequest(BaseModel):
     place_id: str
@@ -821,7 +850,7 @@ def get_shop_reviews(shop_id: str):
     with get_db_connection() as conn:
         rows = conn.execute(
             """
-            SELECT reviews.id, reviews.shop_id, reviews.rating, reviews.review_text, reviews.created_at, reviews.user_id, users.name
+            SELECT reviews.id, reviews.shop_id, reviews.rating, reviews.review_text, reviews.created_at, reviews.user_id, reviews.context_tags, users.name
             FROM reviews
             JOIN users ON users.id = reviews.user_id
             WHERE reviews.shop_id = ?
@@ -852,21 +881,22 @@ def add_shop_review(shop_id: str, request: ReviewRequest, authorization: str = H
         raise HTTPException(status_code=400, detail="Review text is too short.")
 
     now = datetime.now(timezone.utc).isoformat()
+    context_tags = clean_context_tags(request.context_tags)
 
     with get_db_connection() as conn:
         cursor = conn.execute(
             """
-            INSERT INTO reviews (user_id, shop_id, rating, review_text, created_at)
-            VALUES (?, ?, ?, ?, ?)
+            INSERT INTO reviews (user_id, shop_id, rating, review_text, created_at, context_tags)
+            VALUES (?, ?, ?, ?, ?, ?)
             RETURNING id
             """,
-            (user["id"], shop_id, request.rating, review_text, now),
+            (user["id"], shop_id, request.rating, review_text, now, json.dumps(context_tags)),
         )
         review_id = cursor.fetchone()["id"]
         conn.commit()
         row = conn.execute(
             """
-            SELECT reviews.id, reviews.shop_id, reviews.rating, reviews.review_text, reviews.created_at, reviews.user_id, users.name
+            SELECT reviews.id, reviews.shop_id, reviews.rating, reviews.review_text, reviews.created_at, reviews.user_id, reviews.context_tags, users.name
             FROM reviews
             JOIN users ON users.id = reviews.user_id
             WHERE reviews.id = ?
@@ -903,14 +933,15 @@ def update_review(review_id: int, request: ReviewRequest, authorization: str = H
         if existing["user_id"] != user["id"]:
             raise HTTPException(status_code=403, detail="You can only edit your own reviews.")
 
+        context_tags = clean_context_tags(request.context_tags)
         conn.execute(
-            "UPDATE reviews SET rating = ?, review_text = ? WHERE id = ?",
-            (request.rating, review_text, review_id),
+            "UPDATE reviews SET rating = ?, review_text = ?, context_tags = ? WHERE id = ?",
+            (request.rating, review_text, json.dumps(context_tags), review_id),
         )
         conn.commit()
         row = conn.execute(
             """
-            SELECT reviews.id, reviews.shop_id, reviews.rating, reviews.review_text, reviews.created_at, reviews.user_id, users.name
+            SELECT reviews.id, reviews.shop_id, reviews.rating, reviews.review_text, reviews.created_at, reviews.user_id, reviews.context_tags, users.name
             FROM reviews
             JOIN users ON users.id = reviews.user_id
             WHERE reviews.id = ?
@@ -945,7 +976,7 @@ def get_latest_reviews(limit: int = 8):
     with get_db_connection() as conn:
         rows = conn.execute(
             """
-            SELECT reviews.id, reviews.shop_id, reviews.rating, reviews.review_text, reviews.created_at, reviews.user_id, users.name
+            SELECT reviews.id, reviews.shop_id, reviews.rating, reviews.review_text, reviews.created_at, reviews.user_id, reviews.context_tags, users.name
             FROM reviews
             JOIN users ON users.id = reviews.user_id
             ORDER BY reviews.created_at DESC
