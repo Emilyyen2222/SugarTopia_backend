@@ -137,6 +137,12 @@ def init_app_database():
         conn.execute("""
             ALTER TABLE reviews ADD COLUMN IF NOT EXISTS context_tags TEXT NOT NULL DEFAULT '[]'
         """)
+        # ai_context_tags 是 AI 從評論文字自動分析出來的標籤，跟使用者自己
+        # 勾的 context_tags 分開存——前端要能分別顯示「使用者自選」跟
+        # 「AI 分析」兩種標籤，不是同一批資料混在一起。
+        conn.execute("""
+            ALTER TABLE reviews ADD COLUMN IF NOT EXISTS ai_context_tags TEXT NOT NULL DEFAULT '[]'
+        """)
         conn.execute("""
             CREATE TABLE IF NOT EXISTS curated_shops (
                 id TEXT PRIMARY KEY,
@@ -381,6 +387,10 @@ def serialize_review(row):
         # 評論的按鈕，雖然後端本來就會擋，但按鈕不該一開始就顯示出來）。
         "userId": row["user_id"],
         "contextTags": json.loads(row["context_tags"] or "[]"),
+        # AI 從評論文字自動分析出來的標籤，跟上面使用者自己勾的分開存、
+        # 分開回傳——前端要能分開顯示成不同樣式（見 extract_ai_review_tags()
+        # 的註解）。
+        "aiContextTags": json.loads(row["ai_context_tags"] or "[]"),
     }
 
 def serialize_google_place(place):
@@ -654,6 +664,76 @@ def clean_context_tags(tags):
     # 過濾掉就好，不用因為傳了奇怪的值就擋掉整篇評論。
     return sorted({tag for tag in tags if tag in REVIEW_CONTEXT_TAGS})
 
+# 給 Gemini 看的中文對照（後端這裡只有純 Python，不能借用前端 i18n
+# 語言檔），只是幫助模型理解語意用，不是存進資料庫的欄位。
+REVIEW_CONTEXT_TAG_LABELS_ZH = {
+    "Work Friendly": "適合工作",
+    "Quiet": "安靜",
+    "Outlets": "有插座",
+    "Solo Friendly": "適合一個人",
+    "Instagrammable": "拍照好看",
+    "Long Wait": "排隊要等一下",
+}
+
+def extract_ai_review_tags(review_text, existing_tags):
+    # Phase 4「AI 標籤整理」：從評論文字裡自動抓情境標籤，不用使用者自己
+    # 全部手動勾選。只補使用者「還沒勾」的部分（existing_tags 是使用者
+    # 自己已經選的），避免重複判斷使用者已經明確告訴我們的資訊。
+    #
+    # 這支函式失敗（llm 還沒 ready、Gemini 額度用完、回傳格式解析不出來）
+    # 都直接回空陣列，不拋例外——AI 標籤是評論功能的加分項，不是評論
+    # 送出去的必要條件，AI 那邊出問題不該連帶讓使用者評論送不出去。
+    if llm is None or not review_text.strip():
+        return []
+
+    tag_list = ", ".join(REVIEW_CONTEXT_TAGS)
+    zh_hints = "\n".join(f"{en} = {REVIEW_CONTEXT_TAG_LABELS_ZH[en]}" for en in sorted(REVIEW_CONTEXT_TAGS))
+    existing_line = ", ".join(existing_tags) if existing_tags else "（沒有）"
+
+    prompt = f"""
+    你是在幫忙從使用者寫的甜點店評論裡，抓出符合的情境標籤。
+
+    只能從這個固定清單裡選，不可以自己發明新的標籤：
+    {tag_list}
+
+    這些標籤的中文對照，方便你理解語意：
+    {zh_hints}
+
+    使用者已經自己勾選了這些標籤，不要重複輸出：
+    {existing_line}
+
+    規則：
+    - 只有評論文字裡明確、清楚支持的標籤才能選，不要用一般常識腦補
+      （例如評論完全沒提到插座、座位，不能因為「是咖啡廳」就假設有插座）。
+    - 沒有任何符合的就回傳空陣列，不要為了有結果硬選。
+    - 只能輸出一個 JSON 陣列（例如 ["Quiet", "Long Wait"]），不要有其他
+      文字說明，不要用 markdown code fence。
+
+    評論文字：
+    {review_text}
+    """
+
+    try:
+        response = llm.invoke(prompt)
+        # response.content 不保證一定是字串（有時候是一段結構化的 list/dict），
+        # 跟 /api/chat 那邊遇到的狀況一樣，直接借用同一支 format_model_content()
+        # 轉成純文字，不要自己重寫一次同樣的邏輯。
+        content = format_model_content(response.content).strip()
+        # 保守處理：即使叮嚀了不要用 code fence，Gemini 偶爾還是會包一層
+        # ```json ... ```，這裡順手拆掉，不要因為這種小狀況整段解析失敗。
+        content = re.sub(r"^```(?:json)?|```$", "", content.strip(), flags=re.MULTILINE).strip()
+        parsed = json.loads(content)
+        if not isinstance(parsed, list):
+            return []
+        # clean_context_tags() 已經擋掉字典以外的值；這裡再扣掉使用者自己
+        # 已經勾過的（提示詞裡也要求過，這是雙重保險，不完全依賴模型
+        # 一定會照規則做）。
+        ai_tags = clean_context_tags(str(tag) for tag in parsed)
+        return sorted(set(ai_tags) - set(existing_tags))
+    except Exception as e:
+        print(f"⚠️ AI 標籤分析失敗，忽略、不擋評論送出：{e}")
+        return []
+
 class CuratedShopRequest(BaseModel):
     place_id: str
     category: str = ""
@@ -850,7 +930,7 @@ def get_shop_reviews(shop_id: str):
     with get_db_connection() as conn:
         rows = conn.execute(
             """
-            SELECT reviews.id, reviews.shop_id, reviews.rating, reviews.review_text, reviews.created_at, reviews.user_id, reviews.context_tags, users.name
+            SELECT reviews.id, reviews.shop_id, reviews.rating, reviews.review_text, reviews.created_at, reviews.user_id, reviews.context_tags, reviews.ai_context_tags, users.name
             FROM reviews
             JOIN users ON users.id = reviews.user_id
             WHERE reviews.shop_id = ?
@@ -882,21 +962,26 @@ def add_shop_review(shop_id: str, request: ReviewRequest, authorization: str = H
 
     now = datetime.now(timezone.utc).isoformat()
     context_tags = clean_context_tags(request.context_tags)
+    # 同步呼叫 Gemini（不是背景任務）：評論不是每分鐘都有人在寫，量不大，
+    # 先用最簡單的做法，不用一開始就搞非同步機制。AI 失敗不會擋評論送出
+    # （見 extract_ai_review_tags() 內部的例外處理），最壞情況只是這則
+    # 評論沒有 AI 標籤，不影響評論本身送出成功。
+    ai_context_tags = extract_ai_review_tags(review_text, context_tags)
 
     with get_db_connection() as conn:
         cursor = conn.execute(
             """
-            INSERT INTO reviews (user_id, shop_id, rating, review_text, created_at, context_tags)
-            VALUES (?, ?, ?, ?, ?, ?)
+            INSERT INTO reviews (user_id, shop_id, rating, review_text, created_at, context_tags, ai_context_tags)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
             RETURNING id
             """,
-            (user["id"], shop_id, request.rating, review_text, now, json.dumps(context_tags)),
+            (user["id"], shop_id, request.rating, review_text, now, json.dumps(context_tags), json.dumps(ai_context_tags)),
         )
         review_id = cursor.fetchone()["id"]
         conn.commit()
         row = conn.execute(
             """
-            SELECT reviews.id, reviews.shop_id, reviews.rating, reviews.review_text, reviews.created_at, reviews.user_id, reviews.context_tags, users.name
+            SELECT reviews.id, reviews.shop_id, reviews.rating, reviews.review_text, reviews.created_at, reviews.user_id, reviews.context_tags, reviews.ai_context_tags, users.name
             FROM reviews
             JOIN users ON users.id = reviews.user_id
             WHERE reviews.id = ?
@@ -934,14 +1019,17 @@ def update_review(review_id: int, request: ReviewRequest, authorization: str = H
             raise HTTPException(status_code=403, detail="You can only edit your own reviews.")
 
         context_tags = clean_context_tags(request.context_tags)
+        # 編輯評論也重新跑一次 AI 分析：文字內容可能整個改過，舊的 AI
+        # 標籤不見得還準；重新分析一次成本不高（評論編輯本來就不頻繁）。
+        ai_context_tags = extract_ai_review_tags(review_text, context_tags)
         conn.execute(
-            "UPDATE reviews SET rating = ?, review_text = ?, context_tags = ? WHERE id = ?",
-            (request.rating, review_text, json.dumps(context_tags), review_id),
+            "UPDATE reviews SET rating = ?, review_text = ?, context_tags = ?, ai_context_tags = ? WHERE id = ?",
+            (request.rating, review_text, json.dumps(context_tags), json.dumps(ai_context_tags), review_id),
         )
         conn.commit()
         row = conn.execute(
             """
-            SELECT reviews.id, reviews.shop_id, reviews.rating, reviews.review_text, reviews.created_at, reviews.user_id, reviews.context_tags, users.name
+            SELECT reviews.id, reviews.shop_id, reviews.rating, reviews.review_text, reviews.created_at, reviews.user_id, reviews.context_tags, reviews.ai_context_tags, users.name
             FROM reviews
             JOIN users ON users.id = reviews.user_id
             WHERE reviews.id = ?
@@ -976,7 +1064,7 @@ def get_latest_reviews(limit: int = 8):
     with get_db_connection() as conn:
         rows = conn.execute(
             """
-            SELECT reviews.id, reviews.shop_id, reviews.rating, reviews.review_text, reviews.created_at, reviews.user_id, reviews.context_tags, users.name
+            SELECT reviews.id, reviews.shop_id, reviews.rating, reviews.review_text, reviews.created_at, reviews.user_id, reviews.context_tags, reviews.ai_context_tags, users.name
             FROM reviews
             JOIN users ON users.id = reviews.user_id
             ORDER BY reviews.created_at DESC
