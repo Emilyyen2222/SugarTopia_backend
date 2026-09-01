@@ -1,105 +1,46 @@
 # SugarTopia Backend
 
-SugarTopia 的 FastAPI 後端服務，負責提供 AI 甜點推薦 API。
+SugarTopia 的 FastAPI 後端服務，負責提供店家資料、會員系統、收藏／評論、Google Places 店家收錄，以及 AI 甜點推薦 API。
+
+- **想知道怎麼跑起來、怎麼部署、環境變數要填什麼** → 看 [`DEPLOYMENT.md`](./DEPLOYMENT.md)。
+- **想知道某個設計為什麼這樣做、踩過什麼雷** → 看 [`BACKEND_LEARNING_NOTES.md`](./BACKEND_LEARNING_NOTES.md)。
+- **想知道接下來還可以做什麼** → 看 [`PROJECT_ROADMAP.md`](./PROJECT_ROADMAP.md)。
 
 ## Online URLs
 
-Frontend:
+Frontend: `https://sugartopia.vercel.app`
 
-```text
-https://sugar-topia.vercel.app
-```
+Backend: `https://sugartopia-backend-673387630043.asia-east1.run.app`
 
-Backend:
-
-```text
-https://sugartopia-backend-673387630043.asia-east1.run.app
-```
-
-API docs:
-
-```text
-https://sugartopia-backend-673387630043.asia-east1.run.app/docs
-```
+API docs（Swagger UI）: `https://sugartopia-backend-673387630043.asia-east1.run.app/docs`
 
 ## Main APIs
 
-Shop list:
-
-```text
-GET /api/shops
-```
-
-Example:
+Shop list（支援 `q`／`location`／`category` 篩選）：
 
 ```text
 GET /api/shops?q=matcha&location=songshan
 ```
 
-Response:
+Shop detail：
 
-```json
-{
-  "total": 1,
-  "shops": [
-    {
-      "id": "matcha-mori-house",
-      "name": "Matcha Mori House",
-      "category": "Japanese Dessert",
-      "location": "Songshan, Taipei"
-    }
-  ]
-}
+```text
+GET /api/shops/{id}
 ```
 
-AI chat:
+AI chat（依 SugarTopia 收錄的店家資料回答推薦問題）：
 
 ```text
 POST /api/chat
+{ "message": "我想吃抹茶甜點，有推薦嗎？" }
 ```
 
-Request:
+會員系統：`POST /api/auth/signup`、`POST /api/auth/login`、`POST /api/auth/logout`、`GET /api/auth/me`
 
-```json
-{
-  "message": "我想吃抹茶甜點，有推薦嗎？"
-}
-```
+收藏：`GET/POST /api/favorites`、`DELETE /api/favorites/{shop_id}`
 
-Response:
+評論：`GET/POST /api/shops/{id}/reviews`、`PUT/DELETE /api/reviews/{id}`、`GET /api/reviews/latest`
 
-```json
-{
-  "reply": "推薦內容..."
-}
-```
+Google Places 店家收錄（需要登入 `ADMIN_EMAILS` 白名單帳號，見 `DEPLOYMENT.md`）：`GET /api/google/places/search`、`POST /api/shops/curated`
 
-## Local Development
-
-```bash
-cd /Users/mike/Documents/emily_project_archive/SugarTopia_backend
-source venv/bin/activate
-uvicorn main:app --reload
-```
-
-Local backend:
-
-```text
-http://127.0.0.1:8000
-```
-
-## Environment Variables
-
-Local development uses `.env`.
-
-Cloud Run uses service environment variables.
-
-Required:
-
-```env
-GOOGLE_API_KEY=your Gemini API key
-GEMINI_MODEL=gemini-3.6-flash
-GEMINI_EMBEDDING_MODEL=models/gemini-embedding-001
-```
-
-Do not commit `.env`.
+完整清單、每支 API 實際的 request/response 格式，直接看上面的 API 文件頁最準確。
