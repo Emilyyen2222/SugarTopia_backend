@@ -27,6 +27,9 @@ GEMINI_EMBEDDING_MODEL = os.getenv("GEMINI_EMBEDDING_MODEL", "models/gemini-embe
 # 這把 key 是另外申請的 Google Maps Platform key，故意跟上面 Gemini 用的
 # GOOGLE_API_KEY 分開，避免混用（兩個是不同的 Google Cloud 服務、不同的計費）。
 GOOGLE_PLACES_API_KEY = os.getenv("GOOGLE_PLACES_API_KEY")
+# 首頁 hero 圖片輪播用的免費圖庫 key，跟上面兩把 key（Gemini／Google Places）
+# 完全獨立，是另一家服務（Pexels）、另一組帳號申請的。
+PEXELS_API_KEY = os.getenv("PEXELS_API_KEY")
 GOOGLE_PLACES_BASE_URL = "https://places.googleapis.com/v1"
 # 存進 curated_shops 的 image 欄位需要是一個完整網址（前端 resolveShopImage()
 # 看到 http/https 開頭就直接原樣使用，不會再幫忙補 host）——因為圖片是靠
@@ -163,6 +166,19 @@ def init_app_database():
                 google_place_id TEXT NOT NULL UNIQUE,
                 google_maps_url TEXT NOT NULL DEFAULT '',
                 created_at TEXT NOT NULL
+            )
+        """)
+        # 首頁 hero 輪播圖，從 Pexels 抓來的甜點/咖啡照片快取——不是每個
+        # 訪客進站都即時打一次 Pexels API（免費額度不夠用，也會拖慢首頁
+        # 載入），而是後端啟動時抓一批存這裡，前端只讀這張表。
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS hero_photos (
+                id SERIAL PRIMARY KEY,
+                url TEXT NOT NULL,
+                photographer TEXT NOT NULL DEFAULT '',
+                photographer_url TEXT NOT NULL DEFAULT '',
+                pexels_url TEXT NOT NULL DEFAULT '',
+                fetched_at TEXT NOT NULL
             )
         """)
         conn.commit()
@@ -351,6 +367,64 @@ def load_curated_shops():
 
     return [normalize_curated_shop(row) for row in rows]
 
+# 首頁 hero 輪播圖用的搜尋關鍵字，故意用好幾個不同的字分開搜，每個字
+# 只抓 2 張——只搜一個關鍵字（例如都搜 "dessert"）容易抓到很像的照片
+# （同一批熱門結果），分開搜幾個相關但不同的字，輪播起來畫面比較有
+# 變化。
+PEXELS_HERO_QUERIES = ["dessert", "cafe", "bakery", "coffee shop", "pastry"]
+
+def refresh_hero_photos():
+    # 跟向量資料庫、curated_shops 一樣的取捨：只在後端啟動時抓一次，
+    # 不是即時抓、也沒有排程定期更新——Pexels 免費額度不高，這個是
+    # 「刻意先簡單做」的版本，之後如果想做到真的每天自動換一批，可以
+    # 加 Cloud Scheduler 定期打一支後端的刷新端點，而不是現在這種
+    # 每次開機才換的做法。任何失敗（key 沒設定、API 打不通、額度用完）
+    # 都不拋例外——首頁輪播圖抓不到新照片，不該連帶讓整個後端開機失敗。
+    if not PEXELS_API_KEY:
+        print("⚠️ 沒有設定 PEXELS_API_KEY，首頁 hero 輪播圖沿用前端本地圖片。")
+        return
+
+    photos = []
+    for query in PEXELS_HERO_QUERIES:
+        try:
+            response = requests.get(
+                "https://api.pexels.com/v1/search",
+                headers={"Authorization": PEXELS_API_KEY},
+                params={"query": query, "per_page": 2},
+                timeout=10,
+            )
+            response.raise_for_status()
+            for photo in response.json().get("photos", []):
+                photos.append({
+                    "url": photo["src"]["landscape"],
+                    "photographer": photo.get("photographer", ""),
+                    "photographer_url": photo.get("photographer_url", ""),
+                    "pexels_url": photo.get("url", ""),
+                })
+        except Exception as e:
+            print(f"⚠️ Pexels 搜尋「{query}」失敗，跳過這個關鍵字：{e}")
+
+    if not photos:
+        print("⚠️ Pexels 一張照片都沒抓到，首頁 hero 輪播圖沿用前端本地圖片。")
+        return
+
+    now = datetime.now(timezone.utc).isoformat()
+    with get_db_connection() as conn:
+        # 每次重新抓都整批換掉，不是疊加——舊的那批快取沒有保留的必要，
+        # 也不用另外寫「哪些是舊的、該刪掉」的邏輯。
+        conn.execute("DELETE FROM hero_photos")
+        for photo in photos:
+            conn.execute(
+                """
+                INSERT INTO hero_photos (url, photographer, photographer_url, pexels_url, fetched_at)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (photo["url"], photo["photographer"], photo["photographer_url"], photo["pexels_url"], now),
+            )
+        conn.commit()
+
+    print(f"✅ 首頁 hero 輪播圖已更新，共 {len(photos)} 張（來自 Pexels）。")
+
 def get_search_text(shop):
     values = [
         shop["name"],
@@ -527,6 +601,14 @@ try:
 except Exception as e:
     startup_error = f"會員資料庫初始化失敗：{e}"
     print(f"❌ {startup_error}")
+
+# 獨立的 try/except，不要跟上面會員資料庫那段共用：hero 輪播圖是錦上添花
+# 的功能，Pexels 出狀況不該讓 startup_error 被覆蓋掉、也不該影響會員
+# 系統/店家資料是否成功載入的判斷。
+try:
+    refresh_hero_photos()
+except Exception as e:
+    print(f"⚠️ 首頁 hero 輪播圖更新失敗，沿用前端本地圖片：{e}")
 
 try:
     if not GOOGLE_API_KEY:
@@ -837,6 +919,25 @@ def logout(authorization: str = Header(default="")):
 
     return {
         "message": "Logged out successfully.",
+    }
+
+@app.get("/api/hero-photos")
+def get_hero_photos():
+    # 公開端點，不用登入——這批照片本來就是首頁公開顯示用的，跟店家
+    # 資料一樣的開放程度。
+    with get_db_connection() as conn:
+        rows = conn.execute("SELECT * FROM hero_photos ORDER BY id ASC").fetchall()
+
+    return {
+        "photos": [
+            {
+                "url": row["url"],
+                "photographer": row["photographer"],
+                "photographerUrl": row["photographer_url"],
+                "pexelsUrl": row["pexels_url"],
+            }
+            for row in rows
+        ],
     }
 
 @app.get("/api/shops")
