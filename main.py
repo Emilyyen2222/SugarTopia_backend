@@ -371,7 +371,13 @@ def load_curated_shops():
 # 只抓 2 張——只搜一個關鍵字（例如都搜 "dessert"）容易抓到很像的照片
 # （同一批熱門結果），分開搜幾個相關但不同的字，輪播起來畫面比較有
 # 變化。
-PEXELS_HERO_QUERIES = ["dessert", "cafe", "bakery", "coffee shop", "pastry"]
+#
+# "cafe"／"coffee shop"／"pastry" 這幾個字太籠統，實測會抓到不少跟
+# 甜點/咖啡廳沒什麼關係的街景照（見這次調整前的觀察），換成更具體的
+# 詞組（"pastry dessert"、"coffee cup"）結果明顯更切題。"dog friendly
+# cafe" 是使用者要求加的，呼應網站本身「毛孩友善」這個分類，也實測過
+# 確實會抓到真的有狗在咖啡廳的照片，不是隨便湊的關鍵字。
+PEXELS_HERO_QUERIES = ["dessert", "pastry dessert", "coffee cup", "bakery", "dog friendly cafe"]
 
 def refresh_hero_photos():
     # 跟向量資料庫、curated_shops 一樣的取捨：只在後端啟動時抓一次，
