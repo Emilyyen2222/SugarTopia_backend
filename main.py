@@ -684,7 +684,12 @@ try:
         raise RuntimeError(f"資料庫載入失敗，請確認檔案與 Gemini API key 是否正確。錯誤: {e}") from e
 
     # 4. 設定 Gemini 語言模型 (改用 LangChain 模組解決棄用警告)
-    llm = ChatGoogleGenerativeAI(model=GEMINI_MODEL, google_api_key=GOOGLE_API_KEY)
+    # timeout=15：原本沒設超時，Gemini 額度被限流／回應變慢時 llm.invoke()
+    # 會卡住不回應，卡多久沒有上限——這是實測跑 Playwright 測試時真的
+    # 踩到的（POST /api/shops/{id}/reviews 卡到前端 30 秒直接逾時失敗）。
+    # 這支 llm 物件同時給 /api/chat 跟 extract_ai_review_tags() 共用，兩邊
+    # 都受惠於同一個超時設定，不用各自補。
+    llm = ChatGoogleGenerativeAI(model=GEMINI_MODEL, google_api_key=GOOGLE_API_KEY, timeout=15)
 except Exception as e:
     startup_error = str(e)
     print(f"❌ AI 服務初始化失敗: {startup_error}")
