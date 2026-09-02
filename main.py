@@ -181,6 +181,20 @@ def init_app_database():
                 fetched_at TEXT NOT NULL
             )
         """)
+        # Phase 4「甜點願望單」：使用者直接輸入一段情境需求存起來（例如
+        # 「想找台北焦糖布丁、安靜、可以坐兩小時的店」），不用先篩選、
+        # 不用符合固定欄位——這批資料本身代表的是「使用者真正想要什麼」，
+        # 跟評論（描述已經去過的店）是不同性質的資料。MVP 版本只存文字，
+        # 沒有自動比對現有店家、沒有通知機制，那些是之後才要做的延伸。
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS wishlist (
+                id SERIAL PRIMARY KEY,
+                user_id INTEGER NOT NULL,
+                text TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                FOREIGN KEY (user_id) REFERENCES users(id)
+            )
+        """)
         conn.commit()
 
 def serialize_user(row):
@@ -728,6 +742,9 @@ class LoginRequest(BaseModel):
 class FavoriteRequest(BaseModel):
     shop_id: str
 
+class WishlistRequest(BaseModel):
+    text: str
+
 class ReviewRequest(BaseModel):
     rating: int
     text: str
@@ -1028,6 +1045,58 @@ def remove_favorite(shop_id: str, authorization: str = Header(default="")):
         conn.commit()
 
     return {"message": "Shop removed from favorites.", "shopId": shop_id}
+
+@app.get("/api/wishlist")
+def get_wishlist(authorization: str = Header(default="")):
+    user = require_current_user(authorization)
+
+    with get_db_connection() as conn:
+        rows = conn.execute(
+            "SELECT id, text, created_at FROM wishlist WHERE user_id = ? ORDER BY created_at DESC",
+            (user["id"],),
+        ).fetchall()
+
+    return {
+        "total": len(rows),
+        "items": [{"id": row["id"], "text": row["text"], "createdAt": row["created_at"]} for row in rows],
+    }
+
+@app.post("/api/wishlist")
+def add_wishlist_item(request: WishlistRequest, authorization: str = Header(default="")):
+    user = require_current_user(authorization)
+
+    text = request.text.strip()
+    if len(text) < 2:
+        raise HTTPException(status_code=400, detail="Wishlist text is too short.")
+
+    now = datetime.now(timezone.utc).isoformat()
+
+    with get_db_connection() as conn:
+        cursor = conn.execute(
+            "INSERT INTO wishlist (user_id, text, created_at) VALUES (?, ?, ?) RETURNING id",
+            (user["id"], text, now),
+        )
+        item_id = cursor.fetchone()["id"]
+        conn.commit()
+
+    return {"id": item_id, "text": text, "createdAt": now}
+
+@app.delete("/api/wishlist/{item_id}")
+def remove_wishlist_item(item_id: int, authorization: str = Header(default="")):
+    user = require_current_user(authorization)
+
+    with get_db_connection() as conn:
+        # 跟收藏／評論同一種「WHERE 條件裡帶上 user_id」的做法，靠資料庫
+        # 本身擋掉別人的資料——這裡不像評論那樣需要另外查一次來區分
+        # 404／403，因為願望單本來就沒有「看得到但不能刪」這種中間狀態，
+        # 不是自己的就等於查無此筆，統一都是「沒東西可以刪」，回應一樣。
+        conn.execute(
+            "DELETE FROM wishlist WHERE id = ? AND user_id = ?",
+            (item_id, user["id"]),
+        )
+        conn.commit()
+
+    return {"message": "Wishlist item deleted.", "id": item_id}
 
 @app.get("/api/shops/{shop_id}/reviews")
 def get_shop_reviews(shop_id: str):
