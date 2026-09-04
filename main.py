@@ -2,10 +2,13 @@ from fastapi import FastAPI
 from fastapi import HTTPException
 from fastapi import Header
 from fastapi import Response
+from fastapi import File
+from fastapi import UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import bcrypt
 from datetime import datetime, timedelta, timezone
+import io
 import json
 import os
 import re
@@ -15,6 +18,7 @@ from urllib.parse import quote
 import psycopg2
 import psycopg2.extras
 from dotenv import load_dotenv
+from PIL import Image
 from langchain_google_genai import GoogleGenerativeAIEmbeddings, ChatGoogleGenerativeAI
 from langchain_community.vectorstores import Chroma
 from langchain_core.documents import Document
@@ -101,6 +105,23 @@ def init_app_database():
                 password_hash TEXT NOT NULL,
                 created_at TEXT NOT NULL
             )
+        """)
+        # 大頭貼真上傳：圖片本身（縮圖壓縮後的 JPEG bytes）直接存進 Postgres
+        # 的 bytea 欄位，不用另外開 Google Cloud Storage 之類的雲端物件儲存
+        # ——跟這個專案「能簡單做就先簡單做」的取捨一致（首頁 hero 圖、
+        # Google Places 照片都是走「後端代理／後端存」，不是前端直接串
+        # 第三方雲端服務）。avatar_updated_at 除了記錄「有沒有上傳過大頭貼」
+        # （NULL 就是沒有，前端退回姓名色塊+字母的假頭貼），也拿來當
+        # /api/users/{id}/avatar?v=... 網址上的 cache-busting 參數，換大頭貼
+        # 後瀏覽器不會因為 URL 沒變而繼續顯示舊圖的快取。
+        conn.execute("""
+            ALTER TABLE users ADD COLUMN IF NOT EXISTS avatar_data BYTEA
+        """)
+        conn.execute("""
+            ALTER TABLE users ADD COLUMN IF NOT EXISTS avatar_content_type TEXT
+        """)
+        conn.execute("""
+            ALTER TABLE users ADD COLUMN IF NOT EXISTS avatar_updated_at TEXT
         """)
         conn.execute("""
             CREATE TABLE IF NOT EXISTS sessions (
@@ -197,12 +218,22 @@ def init_app_database():
         """)
         conn.commit()
 
+def avatar_url_for(user_id, avatar_updated_at):
+    # avatar_updated_at 是 NULL 就代表這個使用者沒上傳過大頭貼——回傳 None，
+    # 前端看到 avatarUrl 是 null 就退回姓名色塊+字母的假頭貼（ReviewerAvatar.vue
+    # 原本就有的邏輯，不用大改）。有值的話拿它當 ?v= 版本號，換大頭貼後
+    # 網址會變、瀏覽器快取才會跟著失效。
+    if not avatar_updated_at:
+        return None
+    return f"{PUBLIC_BASE_URL}/api/users/{user_id}/avatar?v={quote(avatar_updated_at)}"
+
 def serialize_user(row):
     return {
         "id": row["id"],
         "name": row["name"],
         "email": row["email"],
         "createdAt": row["created_at"],
+        "avatarUrl": avatar_url_for(row["id"], row["avatar_updated_at"]),
     }
 
 def hash_password(password):
@@ -247,7 +278,7 @@ def get_current_user_from_token(token):
     with get_db_connection() as conn:
         row = conn.execute(
             """
-            SELECT users.id, users.name, users.email, users.created_at, sessions.expires_at
+            SELECT users.id, users.name, users.email, users.created_at, users.avatar_updated_at, sessions.expires_at
             FROM sessions
             JOIN users ON users.id = sessions.user_id
             WHERE sessions.token = ?
@@ -482,6 +513,7 @@ def serialize_review(row):
         "text": row["review_text"],
         "createdAt": row["created_at"],
         "reviewerName": row["name"],
+        "reviewerAvatarUrl": avatar_url_for(row["user_id"], row["avatar_updated_at"]),
         # 前端要知道「這則評論是不是我自己寫的」才能決定要不要顯示編輯／
         # 刪除按鈕，不能只靠「有沒有登入」判斷（登入了也不該能刪別人的
         # 評論的按鈕，雖然後端本來就會擋，但按鈕不該一開始就顯示出來）。
@@ -937,7 +969,7 @@ def signup(request: SignupRequest):
             user_id = cursor.fetchone()["id"]
             conn.commit()
             user = conn.execute(
-                "SELECT id, name, email, created_at FROM users WHERE id = ?",
+                "SELECT id, name, email, created_at, avatar_updated_at FROM users WHERE id = ?",
                 (user_id,),
             ).fetchone()
     except psycopg2.errors.UniqueViolation:
@@ -957,7 +989,7 @@ def login(request: LoginRequest):
 
     with get_db_connection() as conn:
         user = conn.execute(
-            "SELECT id, name, email, password_hash, created_at FROM users WHERE email = ?",
+            "SELECT id, name, email, password_hash, created_at, avatar_updated_at FROM users WHERE email = ?",
             (email,),
         ).fetchone()
 
@@ -991,6 +1023,99 @@ def logout(authorization: str = Header(default="")):
     return {
         "message": "Logged out successfully.",
     }
+
+# 大頭貼上傳大小上限：5MB，擋在讀進 Pillow 之前就先擋掉，不要讓使用者
+# 傳一張超大圖片才發現拒絕，也避免真的把大檔案整個讀進記憶體。
+AVATAR_MAX_UPLOAD_BYTES = 5 * 1024 * 1024
+# 頭貼統一存成正方形縮圖，256px 對頭貼這種小圖已經很夠用（顯示大小最大
+# 也就 50px 左右，加大只是浪費資料庫空間），存成 JPEG（不用 PNG／WebP，
+# 相容性最好、Pillow 內建支援不用額外裝東西）。
+AVATAR_SIZE = 256
+
+@app.post("/api/users/me/avatar")
+def upload_avatar(authorization: str = Header(default=""), file: UploadFile = File(...)):
+    user = require_current_user(authorization)
+
+    if not (file.content_type or "").startswith("image/"):
+        raise HTTPException(status_code=400, detail="File must be an image.")
+
+    raw_bytes = file.file.read(AVATAR_MAX_UPLOAD_BYTES + 1)
+    if len(raw_bytes) > AVATAR_MAX_UPLOAD_BYTES:
+        raise HTTPException(status_code=400, detail="Image is too large (max 5MB).")
+
+    try:
+        image = Image.open(io.BytesIO(raw_bytes))
+        image.load()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Could not read this image file.")
+
+    # 統一轉成 RGB（原圖可能是 RGBA／CMYK／灰階，存 JPEG 前先轉成同一種
+    # 色彩模式，不然 Pillow 存 JPEG 遇到 RGBA 會直接噴錯），再置中裁切成
+    # 正方形＋縮小到 AVATAR_SIZE，不管原圖長寬比例是什麼，顯示出來都是
+    # 統一的正方形頭貼。
+    image = image.convert("RGB")
+    width, height = image.size
+    crop_size = min(width, height)
+    left = (width - crop_size) // 2
+    top = (height - crop_size) // 2
+    image = image.crop((left, top, left + crop_size, top + crop_size))
+    image = image.resize((AVATAR_SIZE, AVATAR_SIZE), Image.LANCZOS)
+
+    buffer = io.BytesIO()
+    image.save(buffer, format="JPEG", quality=85)
+    avatar_bytes = buffer.getvalue()
+
+    now = datetime.now(timezone.utc).isoformat()
+    with get_db_connection() as conn:
+        conn.execute(
+            """
+            UPDATE users
+            SET avatar_data = ?, avatar_content_type = ?, avatar_updated_at = ?
+            WHERE id = ?
+            """,
+            (psycopg2.Binary(avatar_bytes), "image/jpeg", now, user["id"]),
+        )
+        conn.commit()
+
+    return {"user": serialize_user({**user, "avatar_updated_at": now})}
+
+@app.delete("/api/users/me/avatar")
+def delete_avatar(authorization: str = Header(default="")):
+    user = require_current_user(authorization)
+
+    with get_db_connection() as conn:
+        conn.execute(
+            """
+            UPDATE users
+            SET avatar_data = NULL, avatar_content_type = NULL, avatar_updated_at = NULL
+            WHERE id = ?
+            """,
+            (user["id"],),
+        )
+        conn.commit()
+
+    return {"user": serialize_user({**user, "avatar_updated_at": None})}
+
+@app.get("/api/users/{user_id}/avatar")
+def get_avatar(user_id: int):
+    # 公開端點，不用登入——大頭貼是給別人看的（評論列表旁邊那顆頭貼），
+    # 跟 /api/hero-photos、/api/places/photo 是同一種「公開展示用資源」。
+    with get_db_connection() as conn:
+        row = conn.execute(
+            "SELECT avatar_data, avatar_content_type FROM users WHERE id = ?",
+            (user_id,),
+        ).fetchone()
+
+    if row is None or row["avatar_data"] is None:
+        raise HTTPException(status_code=404, detail="This user has no avatar.")
+
+    return Response(
+        content=bytes(row["avatar_data"]),
+        media_type=row["avatar_content_type"] or "image/jpeg",
+        # 網址帶 ?v=<avatar_updated_at> 當版本號，內容不會變（除非又重新
+        # 上傳，而重新上傳會換一個新的 v），可以放心長期快取、不怕看到舊圖。
+        headers={"Cache-Control": "public, max-age=31536000, immutable"},
+    )
 
 @app.get("/api/hero-photos")
 def get_hero_photos():
@@ -1154,7 +1279,7 @@ def get_shop_reviews(shop_id: str):
     with get_db_connection() as conn:
         rows = conn.execute(
             """
-            SELECT reviews.id, reviews.shop_id, reviews.rating, reviews.review_text, reviews.created_at, reviews.user_id, reviews.context_tags, reviews.ai_context_tags, users.name
+            SELECT reviews.id, reviews.shop_id, reviews.rating, reviews.review_text, reviews.created_at, reviews.user_id, reviews.context_tags, reviews.ai_context_tags, users.name, users.avatar_updated_at
             FROM reviews
             JOIN users ON users.id = reviews.user_id
             WHERE reviews.shop_id = ?
@@ -1205,7 +1330,7 @@ def add_shop_review(shop_id: str, request: ReviewRequest, authorization: str = H
         conn.commit()
         row = conn.execute(
             """
-            SELECT reviews.id, reviews.shop_id, reviews.rating, reviews.review_text, reviews.created_at, reviews.user_id, reviews.context_tags, reviews.ai_context_tags, users.name
+            SELECT reviews.id, reviews.shop_id, reviews.rating, reviews.review_text, reviews.created_at, reviews.user_id, reviews.context_tags, reviews.ai_context_tags, users.name, users.avatar_updated_at
             FROM reviews
             JOIN users ON users.id = reviews.user_id
             WHERE reviews.id = ?
@@ -1253,7 +1378,7 @@ def update_review(review_id: int, request: ReviewRequest, authorization: str = H
         conn.commit()
         row = conn.execute(
             """
-            SELECT reviews.id, reviews.shop_id, reviews.rating, reviews.review_text, reviews.created_at, reviews.user_id, reviews.context_tags, reviews.ai_context_tags, users.name
+            SELECT reviews.id, reviews.shop_id, reviews.rating, reviews.review_text, reviews.created_at, reviews.user_id, reviews.context_tags, reviews.ai_context_tags, users.name, users.avatar_updated_at
             FROM reviews
             JOIN users ON users.id = reviews.user_id
             WHERE reviews.id = ?
@@ -1288,7 +1413,7 @@ def get_latest_reviews(limit: int = 8):
     with get_db_connection() as conn:
         rows = conn.execute(
             """
-            SELECT reviews.id, reviews.shop_id, reviews.rating, reviews.review_text, reviews.created_at, reviews.user_id, reviews.context_tags, reviews.ai_context_tags, users.name
+            SELECT reviews.id, reviews.shop_id, reviews.rating, reviews.review_text, reviews.created_at, reviews.user_id, reviews.context_tags, reviews.ai_context_tags, users.name, users.avatar_updated_at
             FROM reviews
             JOIN users ON users.id = reviews.user_id
             ORDER BY reviews.created_at DESC

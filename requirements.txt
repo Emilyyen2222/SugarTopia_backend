@@ -74,6 +74,8 @@ orjson==3.11.9
 ormsgpack==1.12.2
 overrides==7.7.0
 packaging==26.3
+Pillow==12.3.0
+python-multipart==0.0.32
 propcache==0.5.2
 proto-plus==1.28.2
 psycopg2-binary==2.9.10
