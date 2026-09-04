@@ -666,9 +666,10 @@ try:
         # （curated_shops 沒有逐則評論文字，description 常常是空的——
         # admin_places.html 收錄流程目前沒有補這欄），格式盡量比照上面
         # 示意資料的寫法，缺的欄位用友善的預設文字頂著，不留空白段落。
-        # 只在開機時讀取一次，之後新收錄的店家要等下次重新部署/重啟才會
-        # 被 AI 問答認識到，不是即時更新——這個限制先記錄，之後有需要
-        # 再改成即時重建索引。
+        # 這裡只處理「開機當下已經存在」的 curated_shops。之後透過 admin
+        # 收錄的新店家不會再走這個迴圈，而是由 add_shop_to_vector_db()
+        # 在新增成功當下增量加進 vector_db（見下面該函式定義），不用等
+        # 下次重新部署/重啟。
         for item in curated_shops:
             content = (
                 f"店名：{item['nameZh'] or item['name']}\n"
@@ -699,6 +700,42 @@ try:
 except Exception as e:
     startup_error = str(e)
     print(f"❌ AI 服務初始化失敗: {startup_error}")
+
+def add_shop_to_vector_db(shop):
+    # AI 即時認識新店家：向量資料庫（vector_db）本來只在後端啟動時建立
+    # 一次（見上面第 2.5 步的註解），所以透過 admin 收錄的新店家，AI
+    # 問答完全不會知道，要等下一次重新部署重啟後端才會被餵進去。這支
+    # 函式在店家新增成功「之後」呼叫，用 Chroma 的 add_documents() 把
+    # 這一家店的資料直接增量加進現有的向量庫，不用整個重建，AI 馬上就
+    # 能認得這家新店。
+    #
+    # 內容格式刻意跟開機時第 2.5 步 curated_shops 那段完全一樣，維持
+    # AI 看到的資料格式一致（新店家在向量庫裡跟舊店家長得一樣，AI 不會
+    # 特別區分「這家是後來加的」）。
+    #
+    # 失敗只印警告、不往外拋例外：新增店家本身已經成功、已經存進資料庫
+    # 了，AI 認不認得這家店是次要的，不該讓這個失敗連帶讓整個新增店家
+    # 的 API 回應失敗（跟 extract_ai_review_tags() 對 AI 失敗的處理方式
+    # 是同一個原則）。
+    global vector_document_count
+    if vector_db is None:
+        return
+    try:
+        content = (
+            f"店名：{shop['nameZh'] or shop['name']}\n"
+            f"英文名稱：{shop['name']}\n"
+            f"分類：{shop['categoryZh'] or shop['category'] or '尚未分類'}\n"
+            f"地點：{shop['locationZh'] or shop['location'] or '台北'}\n"
+            f"評分：{shop['rating'] if shop['rating'] else '暫無評分'}\n"
+            f"特色標籤：{', '.join(shop['tagsZh'] or shop['tags']) or '暫無標籤'}\n"
+            f"介紹：{shop['description'] or 'Google Places 收錄的真實台北店家，目前沒有額外的文字介紹。'}\n"
+            f"資料來源：Google Places 收錄的真實店家"
+        )
+        vector_db.add_documents([Document(page_content=content)])
+        vector_document_count += 1
+        print(f"✅ 新店家「{shop['nameZh'] or shop['name']}」已即時加入 AI 向量資料庫。")
+    except Exception as e:
+        print(f"⚠️ 新店家加入 AI 向量資料庫失敗（不影響店家本身已成功新增）：{e}")
 
 app = FastAPI()
 
@@ -1482,6 +1519,7 @@ def add_curated_shop(request: CuratedShopRequest, authorization: str = Header(de
 
     new_shop = normalize_curated_shop(row)
     shops.append(new_shop)
+    add_shop_to_vector_db(new_shop)
 
     return {"message": "Shop added to SugarTopia.", "shop": new_shop}
 
