@@ -391,7 +391,13 @@ def load_curated_shops():
 # 詞組（"pastry dessert"、"coffee cup"）結果明顯更切題。"dog friendly
 # cafe" 是使用者要求加的，呼應網站本身「毛孩友善」這個分類，也實測過
 # 確實會抓到真的有狗在咖啡廳的照片，不是隨便湊的關鍵字。
-PEXELS_HERO_QUERIES = ["dessert", "pastry dessert", "coffee cup", "bakery", "dog friendly cafe"]
+#
+# 後來使用者覺得原本這組圖不好看，改成統一走日式甜點風格——每個詞組都
+# 先用 curl 打過 Pexels 搜尋 API 實際看過回傳結果，確認抓到的真的是
+# 和菓子/麻糬/抹茶甜點這類主題圖，不是隨便沾邊的照片（例如 "japanese
+# dessert"、"mochi"、"japanese bakery" 這幾個詞組實測會混進壽司卷、
+# 一般麵包架這種不相關的結果，所以沒有採用）。
+PEXELS_HERO_QUERIES = ["wagashi", "mochi dessert", "matcha dessert", "dango", "matcha cafe"]
 
 def refresh_hero_photos():
     # 跟向量資料庫、curated_shops 一樣的取捨：只在後端啟動時抓一次，
