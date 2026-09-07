@@ -54,6 +54,17 @@ ADMIN_EMAILS = {email.strip().lower() for email in os.getenv("ADMIN_EMAILS", "")
 # 資料庫獨立於 Cloud Run 之外，容器重啟不會再影響到資料。
 DATABASE_URL = os.getenv("DATABASE_URL")
 SESSION_HOURS = 24 * 7
+# 忘記密碼寄信用——跟 Gemini／Google Places／Pexels 是同一個「每個服務
+# 各自一把 key」的原則，這把是 Resend（resend.com）帳號申請的，跟其他
+# 服務完全無關。沒有設定的話 forgot-password 端點還是會照常回覆同一句
+# 通用訊息（不能因為信寄不出去就洩漏「這個帳號到底有沒有註冊」），只是
+# 實際上不會真的寄出信，log 會印警告。
+RESEND_API_KEY = os.getenv("RESEND_API_KEY")
+# 重設密碼信裡的連結要指到前端網站，不是後端自己——這把網址純粹是拿來
+# 組信件內容用的字串，跟 CORS 允許清單、PUBLIC_BASE_URL 都是各自獨立的
+# 設定，不要混著改。
+FRONTEND_BASE_URL = os.getenv("FRONTEND_BASE_URL", "http://localhost:4000")
+PASSWORD_RESET_TOKEN_MINUTES = 30
 
 vector_db = None
 llm = None
@@ -128,6 +139,22 @@ def init_app_database():
                 token TEXT PRIMARY KEY,
                 user_id INTEGER NOT NULL,
                 expires_at TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                FOREIGN KEY (user_id) REFERENCES users(id)
+            )
+        """)
+        # 忘記密碼／重設密碼用的一次性 token，跟 sessions 表結構很像（都是
+        # token 當主鍵、都有 expires_at），但特意分開成獨立的表，不是塞進
+        # sessions——這是兩種完全不同性質的憑證：sessions 代表「已經登入」，
+        # 這裡的 token 只代表「有權限設定一次新密碼」，用途、有效期
+        # （PASSWORD_RESET_TOKEN_MINUTES，比 session 短很多）、用過即失效
+        # 的行為都不一樣，混在同一張表裡容易寫錯邏輯。
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS password_resets (
+                token TEXT PRIMARY KEY,
+                user_id INTEGER NOT NULL,
+                expires_at TEXT NOT NULL,
+                used_at TEXT,
                 created_at TEXT NOT NULL,
                 FOREIGN KEY (user_id) REFERENCES users(id)
             )
@@ -289,6 +316,56 @@ def create_session(user_id):
         "token": token,
         "expiresAt": expires_at.isoformat(),
     }
+
+def send_email(to_email, subject, html):
+    # 直接打 Resend 的 REST API（跟這個專案叫 Pexels／Google Places 的
+    # 做法一致，用 requests 直接發，不特別裝一個官方 SDK）。沒設定
+    # RESEND_API_KEY 或請求失敗都只印警告、回傳 False，不拋例外——呼叫端
+    # （forgot_password()）會決定要不要因為寄信失敗而讓整個請求失敗，
+    # 這支函式本身只負責「盡力寄一次」。
+    if not RESEND_API_KEY:
+        print("⚠️ 沒有設定 RESEND_API_KEY，略過寄信（只在後端 log 印警告，不影響 API 回應）。")
+        return False
+
+    try:
+        response = requests.post(
+            "https://api.resend.com/emails",
+            headers={"Authorization": f"Bearer {RESEND_API_KEY}"},
+            json={
+                # Resend 的預設測試寄件地址，跟 emily_portfolio 那個聯絡表單
+                # 用的是同一個——沒有另外驗證自訂網域，用這個地址寄信不用
+                # 額外設定 DNS 記錄就能動。
+                "from": "SugarTopia <onboarding@resend.dev>",
+                "to": [to_email],
+                "subject": subject,
+                "html": html,
+            },
+            timeout=10,
+        )
+        if not response.ok:
+            print(f"⚠️ Resend 寄信失敗：{response.status_code} {response.text}")
+            return False
+        return True
+    except requests.RequestException as e:
+        print(f"⚠️ Resend 寄信失敗（連不上 Resend）：{e}")
+        return False
+
+def create_password_reset_token(user_id):
+    token = secrets.token_urlsafe(32)
+    now = datetime.now(timezone.utc)
+    expires_at = now + timedelta(minutes=PASSWORD_RESET_TOKEN_MINUTES)
+
+    with get_db_connection() as conn:
+        conn.execute(
+            """
+            INSERT INTO password_resets (token, user_id, expires_at, created_at)
+            VALUES (?, ?, ?, ?)
+            """,
+            (token, user_id, expires_at.isoformat(), now.isoformat()),
+        )
+        conn.commit()
+
+    return token
 
 def get_bearer_token(authorization):
     if not authorization:
@@ -900,6 +977,13 @@ class LoginRequest(BaseModel):
     email: str
     password: str
 
+class ForgotPasswordRequest(BaseModel):
+    email: str
+
+class ResetPasswordRequest(BaseModel):
+    token: str
+    password: str
+
 class FavoriteRequest(BaseModel):
     shop_id: str
 
@@ -1104,6 +1188,73 @@ def logout(authorization: str = Header(default="")):
     return {
         "message": "Logged out successfully.",
     }
+
+FORGOT_PASSWORD_GENERIC_MESSAGE = (
+    "If an account exists for this email, we've sent a password reset link."
+)
+
+@app.post("/api/auth/forgot-password")
+def forgot_password(request: ForgotPasswordRequest):
+    email = normalize_email(request.email)
+
+    with get_db_connection() as conn:
+        user = conn.execute("SELECT id, name FROM users WHERE email = ?", (email,)).fetchone()
+
+    # 不管這個 email 有沒有註冊過，都回同一句話——如果查無帳號就老實說
+    # 「這個信箱沒有註冊」，等於讓任何人都能拿一份 email 清單來測試「這個
+    # 信箱是不是 SugarTopia 的會員」，這是帳號列舉（account enumeration）
+    # 這個常見資安問題的標準防範做法。真正決定「有沒有寄出信」的邏輯
+    # （查得到才寄）在下面，跟回應內容是分開的兩件事。
+    if user is not None:
+        token = create_password_reset_token(user["id"])
+        reset_url = f"{FRONTEND_BASE_URL}/reset-password?token={quote(token)}"
+        send_email(
+            email,
+            "Reset your SugarTopia password",
+            f"""
+            <p>Hi {user['name']},</p>
+            <p>Someone requested a password reset for your SugarTopia account. If this was you, click the link below to set a new password. This link expires in {PASSWORD_RESET_TOKEN_MINUTES} minutes.</p>
+            <p><a href="{reset_url}">{reset_url}</a></p>
+            <p>If you didn't request this, you can safely ignore this email — your password won't be changed.</p>
+            """,
+        )
+
+    return {"message": FORGOT_PASSWORD_GENERIC_MESSAGE}
+
+@app.post("/api/auth/reset-password")
+def reset_password(request: ResetPasswordRequest):
+    if len(request.password) < 8:
+        raise HTTPException(status_code=400, detail="Password must be at least 8 characters.")
+
+    now = datetime.now(timezone.utc).isoformat()
+
+    with get_db_connection() as conn:
+        reset = conn.execute(
+            "SELECT user_id, expires_at, used_at FROM password_resets WHERE token = ?",
+            (request.token,),
+        ).fetchone()
+
+        if reset is None:
+            raise HTTPException(status_code=400, detail="This reset link is invalid.")
+
+        if reset["used_at"] is not None:
+            raise HTTPException(status_code=400, detail="This reset link has already been used.")
+
+        if reset["expires_at"] <= now:
+            raise HTTPException(status_code=400, detail="This reset link has expired. Please request a new one.")
+
+        conn.execute(
+            "UPDATE users SET password_hash = ? WHERE id = ?",
+            (hash_password(request.password), reset["user_id"]),
+        )
+        conn.execute("UPDATE password_resets SET used_at = ? WHERE token = ?", (now, request.token))
+        # 改密碼後把這個帳號所有現有的登入 session 都清掉，強制所有裝置
+        # 重新登入——如果密碼外洩導致有人真的需要重設密碼，被盜用的舊
+        # session 不該繼續有效。
+        conn.execute("DELETE FROM sessions WHERE user_id = ?", (reset["user_id"],))
+        conn.commit()
+
+    return {"message": "Your password has been reset. Please log in with your new password."}
 
 # 大頭貼上傳大小上限：5MB，擋在讀進 Pillow 之前就先擋掉，不要讓使用者
 # 傳一張超大圖片才發現拒絕，也避免真的把大檔案整個讀進記憶體。
