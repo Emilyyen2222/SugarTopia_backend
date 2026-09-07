@@ -203,6 +203,20 @@ def init_app_database():
                 created_at TEXT NOT NULL
             )
         """)
+        # curated_shops 在正式環境已經有真實資料了，同樣要用 ALTER TABLE
+        # ADD COLUMN IF NOT EXISTS 補欄位（CREATE TABLE IF NOT EXISTS 對已
+        # 存在的表沒有效果）。完整營業時間：格式是 Google Places API 回傳的
+        # weekdayDescriptions 陣列（例如 ["Monday: 9:00 AM – 6:00 PM", ...]），
+        # 存進來的當下就是完整一週七天的固定格式，不是「現在有沒有營業」
+        # 這種會隨時間過期的即時狀態——後者需要每次有人看店家頁就重新問
+        # 一次 Google，這裡刻意不做，見 add_curated_shop() 抓 hours 那段
+        # 的註解。
+        conn.execute("""
+            ALTER TABLE curated_shops ADD COLUMN IF NOT EXISTS hours TEXT NOT NULL DEFAULT '[]'
+        """)
+        conn.execute("""
+            ALTER TABLE curated_shops ADD COLUMN IF NOT EXISTS hours_zh TEXT NOT NULL DEFAULT '[]'
+        """)
         # 首頁 hero 輪播圖，從 Pexels 抓來的甜點/咖啡照片快取——不是每個
         # 訪客進站都即時打一次 Pexels API（免費額度不夠用，也會拖慢首頁
         # 載入），而是後端啟動時抓一批存這裡，前端只讀這張表。
@@ -418,6 +432,8 @@ def normalize_curated_shop(row):
         "googleMapsUrl": row["google_maps_url"],
         "lat": row["lat"],
         "lng": row["lng"],
+        "hours": json.loads(row["hours"] or "[]"),
+        "hoursZh": json.loads(row["hours_zh"] or "[]"),
     }
 
 def load_curated_shops():
@@ -589,6 +605,30 @@ def serialize_google_place_details(place):
         "weekdayDescriptions": hours.get("weekdayDescriptions", []),
     })
     return details
+
+def fetch_place_weekday_hours(place_id, language_code=None):
+    # 只抓 weekdayDescriptions 這一個欄位的輕量請求，給 add_curated_shop()
+    # 收錄新店家時各語言各打一次用（見那邊的註解）。刻意獨立成一個函式、
+    # 失敗一律回傳空陣列、不拋例外——這一步只是錦上添花的附加資料，不該
+    # 因為 Google 那邊某個語言查詢失敗，就讓整個「新增店家」的動作跟著
+    # 失敗（跟 add_shop_to_vector_db() 對「次要功能失敗不能擋主要流程」
+    # 的態度是同一個原則）。
+    try:
+        params = {"languageCode": language_code} if language_code else {}
+        response = requests.get(
+            f"{GOOGLE_PLACES_BASE_URL}/places/{place_id}",
+            headers={
+                "X-Goog-Api-Key": GOOGLE_PLACES_API_KEY,
+                "X-Goog-FieldMask": "currentOpeningHours.weekdayDescriptions",
+            },
+            params=params,
+            timeout=10,
+        )
+        if not response.ok:
+            return []
+        return response.json().get("currentOpeningHours", {}).get("weekdayDescriptions", [])
+    except requests.RequestException:
+        return []
 
 def get_google_places_error_detail(response):
     try:
@@ -1775,6 +1815,13 @@ def add_curated_shop(request: CuratedShopRequest, authorization: str = Header(de
     if photos and photos[0].get("name"):
         image_url = f"{PUBLIC_BASE_URL}/api/places/photo?name={quote(photos[0]['name'], safe='')}"
 
+    # 完整營業時間：跟 tags／tagsZh 同一個「英中各存一份」的做法，各打一次
+    # Google Places（languageCode 只能指定一種語言，沒辦法一次拿兩種）。
+    # 這是收錄店家當下才做一次的動作，不是每次有人看店家頁就重新問，所以
+    # 多這兩次額外的 API 呼叫成本可以接受。
+    hours = fetch_place_weekday_hours(place_id)
+    hours_zh = fetch_place_weekday_hours(place_id, language_code="zh-TW")
+
     location = place.get("location", {})
     shop_id = f"{slugify(name)}-{place_id[-6:].lower()}"
     now = datetime.now(timezone.utc).isoformat()
@@ -1785,9 +1832,9 @@ def add_curated_shop(request: CuratedShopRequest, authorization: str = Header(de
             INSERT INTO curated_shops (
                 id, name, name_zh, category, category_zh, location, location_zh,
                 rating, review_count, tags, tags_zh, description, image, lat, lng,
-                google_place_id, google_maps_url, created_at
+                google_place_id, google_maps_url, created_at, hours, hours_zh
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(google_place_id) DO NOTHING
             """,
             (
@@ -1809,6 +1856,8 @@ def add_curated_shop(request: CuratedShopRequest, authorization: str = Header(de
                 place_id,
                 place.get("googleMapsUri", ""),
                 now,
+                json.dumps(hours, ensure_ascii=False),
+                json.dumps(hours_zh, ensure_ascii=False),
             ),
         )
         conn.commit()
