@@ -167,6 +167,20 @@ def init_app_database():
         conn.execute("""
             ALTER TABLE reviews ADD COLUMN IF NOT EXISTS ai_context_tags TEXT NOT NULL DEFAULT '[]'
         """)
+        # 評論照片：跟大頭貼（users.avatar_data）同一個取捨——圖片本身直接
+        # 存進 Postgres 的 bytea 欄位，不用另外開雲端物件儲存。用獨立一張
+        # 表（不是 reviews 表上加一個 bytea 欄位）是因為一則評論可以有多張
+        # 照片（一對多），跟大頭貼「一個使用者只有一張」的一對一關係不同。
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS review_photos (
+                id SERIAL PRIMARY KEY,
+                review_id INTEGER NOT NULL,
+                photo_data BYTEA NOT NULL,
+                content_type TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                FOREIGN KEY (review_id) REFERENCES reviews(id)
+            )
+        """)
         conn.execute("""
             CREATE TABLE IF NOT EXISTS curated_shops (
                 id TEXT PRIMARY KEY,
@@ -505,7 +519,30 @@ def find_shop(shop_id):
 
     return None
 
-def serialize_review(row):
+def review_photo_url(review_id, photo_id):
+    return f"{PUBLIC_BASE_URL}/api/reviews/{review_id}/photos/{photo_id}"
+
+def get_review_photos_map(review_ids):
+    # 批次查一次所有照片、在 Python 這邊依 review_id 分組，而不是每則評論
+    # 各自查一次資料庫——GET /api/shops/{id}/reviews、GET /api/reviews/latest
+    # 一次都要序列化好幾十則評論，每則都各自查一次會是典型的 N+1 查詢
+    # 問題。review_ids 是空的（例如查不到任何評論）就不用打資料庫，直接
+    # 回傳空 dict。
+    if not review_ids:
+        return {}
+
+    with get_db_connection() as conn:
+        rows = conn.execute(
+            "SELECT id, review_id FROM review_photos WHERE review_id = ANY(?) ORDER BY id",
+            (list(review_ids),),
+        ).fetchall()
+
+    photos_map = {}
+    for row in rows:
+        photos_map.setdefault(row["review_id"], []).append(review_photo_url(row["review_id"], row["id"]))
+    return photos_map
+
+def serialize_review(row, photo_urls=None):
     return {
         "id": row["id"],
         "shopId": row["shop_id"],
@@ -523,6 +560,10 @@ def serialize_review(row):
         # 分開回傳——前端要能分開顯示成不同樣式（見 extract_ai_review_tags()
         # 的註解）。
         "aiContextTags": json.loads(row["ai_context_tags"] or "[]"),
+        # 呼叫端沒傳 photo_urls 就當作沒有照片（剛建立的評論本來就還沒有
+        # 照片——照片是送出評論成功、拿到 review id 之後才用另一支
+        # POST /api/reviews/{id}/photos 上傳的，不是同一步）。
+        "photos": photo_urls or [],
     }
 
 def serialize_google_place(place):
@@ -1288,7 +1329,8 @@ def get_shop_reviews(shop_id: str):
             (shop_id,),
         ).fetchall()
 
-    review_list = [serialize_review(row) for row in rows]
+    photos_map = get_review_photos_map([row["id"] for row in rows])
+    review_list = [serialize_review(row, photos_map.get(row["id"])) for row in rows]
 
     return {
         "total": len(review_list),
@@ -1386,7 +1428,12 @@ def update_review(review_id: int, request: ReviewRequest, authorization: str = H
             (review_id,),
         ).fetchone()
 
-    return serialize_review(row)
+    # 編輯評論不會動到照片（照片管理不在這次的編輯表單範圍內，見
+    # POST /api/reviews/{id}/photos 的註解），但如果回傳結果沒帶回原本
+    # 已經上傳的照片，前端會誤以為這則評論編輯後照片不見了（實際上資料庫
+    # 裡還在，只是這次回傳漏掉）——所以還是要查一次現有照片、原樣帶回去。
+    photos_map = get_review_photos_map([review_id])
+    return serialize_review(row, photos_map.get(review_id))
 
 @app.delete("/api/reviews/{review_id}")
 def delete_review(review_id: int, authorization: str = Header(default="")):
@@ -1401,10 +1448,136 @@ def delete_review(review_id: int, authorization: str = Header(default="")):
         if existing["user_id"] != user["id"]:
             raise HTTPException(status_code=403, detail="You can only delete your own reviews.")
 
+        # review_photos 沒有設 ON DELETE CASCADE（這個專案的表大多沒用資料庫
+        # 層級的 cascade，見 reviews／favorites 對 users 的外鍵也是同樣做法），
+        # 刪評論前手動先刪掉這則評論底下的照片，不留孤兒資料列。
+        conn.execute("DELETE FROM review_photos WHERE review_id = ?", (review_id,))
         conn.execute("DELETE FROM reviews WHERE id = ?", (review_id,))
         conn.commit()
 
     return {"message": "Review deleted.", "reviewId": review_id}
+
+# 一則評論最多附幾張照片——不是技術限制，是刻意的產品取捨：評論照片是
+# 輔助文字內容用的佐證，不是相簿功能，太多張反而會讓評論列表變得又長
+# 又重（Postgres 也不是設計來放大量圖片的地方，見上面 review_photos
+# 表的取捨說明）。
+REVIEW_PHOTOS_MAX_PER_REVIEW = 4
+REVIEW_PHOTO_MAX_UPLOAD_BYTES = 5 * 1024 * 1024
+# 跟大頭貼的正方形裁切不一樣：評論照片是使用者實際拍的甜點/店內照，硬裁
+# 成正方形會裁掉重要內容，這裡改成「等比例縮小，最長邊不超過
+# REVIEW_PHOTO_MAX_DIMENSION」，維持原始長寬比例。
+REVIEW_PHOTO_MAX_DIMENSION = 1600
+
+def process_review_photo_upload(raw_bytes):
+    # 抽成共用函式，因為 upload_review_photos() 要對「多個檔案」各自做
+    # 同一套處理（驗證＋解碼＋縮圖＋轉 JPEG bytes），不要每個檔案重複寫
+    # 一次一樣的邏輯。回傳處理好的 JPEG bytes；檔案本身有問題（不是圖片、
+    # 太大）會拋 HTTPException，呼叫端不用另外檢查回傳值是否為 None。
+    if len(raw_bytes) > REVIEW_PHOTO_MAX_UPLOAD_BYTES:
+        raise HTTPException(status_code=400, detail="Image is too large (max 5MB).")
+
+    try:
+        image = Image.open(io.BytesIO(raw_bytes))
+        image.load()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Could not read this image file.")
+
+    image = image.convert("RGB")
+    width, height = image.size
+    longest_side = max(width, height)
+    if longest_side > REVIEW_PHOTO_MAX_DIMENSION:
+        scale = REVIEW_PHOTO_MAX_DIMENSION / longest_side
+        image = image.resize((round(width * scale), round(height * scale)), Image.LANCZOS)
+
+    buffer = io.BytesIO()
+    image.save(buffer, format="JPEG", quality=85)
+    return buffer.getvalue()
+
+@app.post("/api/reviews/{review_id}/photos")
+def upload_review_photos(review_id: int, authorization: str = Header(default=""), files: list[UploadFile] = File(...)):
+    user = require_current_user(authorization)
+
+    with get_db_connection() as conn:
+        review = conn.execute("SELECT user_id FROM reviews WHERE id = ?", (review_id,)).fetchone()
+
+        if review is None:
+            raise HTTPException(status_code=404, detail="Review not found.")
+
+        # 只有評論作者本人能幫自己的評論加照片——跟編輯／刪除評論同一個
+        # 「查一次現有資料的 user_id，不是自己的就明確擋掉」的做法。
+        if review["user_id"] != user["id"]:
+            raise HTTPException(status_code=403, detail="You can only add photos to your own reviews.")
+
+        existing_count = conn.execute(
+            "SELECT COUNT(*) AS count FROM review_photos WHERE review_id = ?", (review_id,)
+        ).fetchone()["count"]
+
+        if existing_count + len(files) > REVIEW_PHOTOS_MAX_PER_REVIEW:
+            raise HTTPException(
+                status_code=400,
+                detail=f"A review can have at most {REVIEW_PHOTOS_MAX_PER_REVIEW} photos.",
+            )
+
+        now = datetime.now(timezone.utc).isoformat()
+        for upload in files:
+            if not (upload.content_type or "").startswith("image/"):
+                raise HTTPException(status_code=400, detail="All files must be images.")
+
+            raw_bytes = upload.file.read(REVIEW_PHOTO_MAX_UPLOAD_BYTES + 1)
+            photo_bytes = process_review_photo_upload(raw_bytes)
+
+            conn.execute(
+                """
+                INSERT INTO review_photos (review_id, photo_data, content_type, created_at)
+                VALUES (?, ?, ?, ?)
+                """,
+                (review_id, psycopg2.Binary(photo_bytes), "image/jpeg", now),
+            )
+        conn.commit()
+
+    photos_map = get_review_photos_map([review_id])
+    return {"photos": photos_map.get(review_id, [])}
+
+@app.get("/api/reviews/{review_id}/photos/{photo_id}")
+def get_review_photo(review_id: int, photo_id: int):
+    # 公開端點，不用登入——評論照片是給別人看的，跟大頭貼／hero 圖／
+    # 店家照片同一種「公開展示用資源」。
+    with get_db_connection() as conn:
+        row = conn.execute(
+            "SELECT photo_data, content_type FROM review_photos WHERE id = ? AND review_id = ?",
+            (photo_id, review_id),
+        ).fetchone()
+
+    if row is None:
+        raise HTTPException(status_code=404, detail="Photo not found.")
+
+    return Response(
+        content=bytes(row["photo_data"]),
+        media_type=row["content_type"] or "image/jpeg",
+        # 這裡的網址沒有像大頭貼那樣帶 ?v= 版本號，因為評論照片本來就不會
+        # 被「換掉」——同一個 photo_id 對應的內容永遠不變（只有整張刪除，
+        # 不會有「更新」這個動作），可以直接放心長期快取。
+        headers={"Cache-Control": "public, max-age=31536000, immutable"},
+    )
+
+@app.delete("/api/reviews/{review_id}/photos/{photo_id}")
+def delete_review_photo(review_id: int, photo_id: int, authorization: str = Header(default="")):
+    user = require_current_user(authorization)
+
+    with get_db_connection() as conn:
+        review = conn.execute("SELECT user_id FROM reviews WHERE id = ?", (review_id,)).fetchone()
+
+        if review is None:
+            raise HTTPException(status_code=404, detail="Review not found.")
+
+        if review["user_id"] != user["id"]:
+            raise HTTPException(status_code=403, detail="You can only delete photos from your own reviews.")
+
+        conn.execute("DELETE FROM review_photos WHERE id = ? AND review_id = ?", (photo_id, review_id))
+        conn.commit()
+
+    photos_map = get_review_photos_map([review_id])
+    return {"photos": photos_map.get(review_id, [])}
 
 @app.get("/api/reviews/latest")
 def get_latest_reviews(limit: int = 8):
@@ -1422,9 +1595,10 @@ def get_latest_reviews(limit: int = 8):
             (capped_limit,),
         ).fetchall()
 
+    photos_map = get_review_photos_map([row["id"] for row in rows])
     review_list = []
     for row in rows:
-        review = serialize_review(row)
+        review = serialize_review(row, photos_map.get(row["id"]))
         shop = find_shop(row["shop_id"])
         review["shopName"] = shop["name"] if shop else row["shop_id"]
         review["shopNameZh"] = shop["nameZh"] if shop else row["shop_id"]
