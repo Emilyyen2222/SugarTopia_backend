@@ -73,7 +73,10 @@ npm run dev
 | `GOOGLE_PLACES_API_KEY` | Google Maps Platform key，跟 Gemini 的 key 分開申請、分開計費，admin 收錄工具用 | 必填（沒有的話 admin 收錄相關 API 會回 503） |
 | `DATABASE_URL` | Supabase PostgreSQL 連線字串 | 必填 |
 | `ADMIN_EMAILS` | 逗號分隔的 email 白名單，只有這些帳號能用 admin 收錄工具（搜尋 Google Places、新增店家）。沒設定 = 全部擋掉，不是全部開放 | 必填才能用 admin 功能，其餘功能不受影響 |
-| `PUBLIC_BASE_URL` | 這個後端自己的對外網址，新收錄店家的照片會存成指到這個網址的 `/api/places/photo` 連結 | 選填，預設 `http://127.0.0.1:8000`，**正式環境一定要設成 Cloud Run 網址**，不然收錄進來的店家照片會連去 localhost，正式環境看不到圖 |
+| `PUBLIC_BASE_URL` | 這個後端自己的對外網址，新收錄店家的照片、大頭貼、評論照片都會存成指到這個網址的連結 | 選填，預設 `http://127.0.0.1:8000`，**正式環境一定要設成 Cloud Run 網址**，不然這些圖片連結會連去 localhost，正式環境看不到圖 |
+| `PEXELS_API_KEY` | Pexels API key，首頁 hero 輪播圖用 | 選填，沒設定的話輪播圖退回前端本地圖片 |
+| `RESEND_API_KEY` | Resend API key，忘記密碼寄信用（跟 `emily_portfolio` 專案共用同一組帳號/key） | 選填，沒設定的話 forgot-password 端點還是正常回應（同一句通用訊息），只是不會真的寄出信 |
+| `FRONTEND_BASE_URL` | 前端網站的網址，用來組忘記密碼信裡的重設連結 | 選填，預設 `http://localhost:4000`，**正式環境要設成 `https://sugartopia.vercel.app`** |
 
 ## 部署後端到 Cloud Run
 

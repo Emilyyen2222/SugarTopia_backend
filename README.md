@@ -37,9 +37,17 @@ POST /api/chat
 
 會員系統：`POST /api/auth/signup`、`POST /api/auth/login`、`POST /api/auth/logout`、`GET /api/auth/me`
 
+忘記密碼／重設密碼：`POST /api/auth/forgot-password`、`POST /api/auth/reset-password`（寄信用 Resend）
+
+大頭貼：`POST/DELETE /api/users/me/avatar`、`GET /api/users/{id}/avatar`（公開）
+
 收藏：`GET/POST /api/favorites`、`DELETE /api/favorites/{shop_id}`
 
 評論：`GET/POST /api/shops/{id}/reviews`、`PUT/DELETE /api/reviews/{id}`、`GET /api/reviews/latest`
+
+評論照片（一則評論最多 4 張）：`POST /api/reviews/{id}/photos`、`GET /api/reviews/{id}/photos/{photoId}`（公開）、`DELETE /api/reviews/{id}/photos/{photoId}`
+
+願望單：`GET/POST /api/wishlist`、`DELETE /api/wishlist/{id}`
 
 Google Places 店家收錄（需要登入 `ADMIN_EMAILS` 白名單帳號，見 `DEPLOYMENT.md`）：`GET /api/google/places/search`、`POST /api/shops/curated`
 
