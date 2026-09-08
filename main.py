@@ -814,17 +814,24 @@ def format_documents(docs):
 
     return context
 
-def get_public_ai_error(error):
+def get_public_ai_error(error, language="zh-TW"):
+    # 這幾句是後端自己寫死的固定訊息（不是 Gemini 生成的），跟著呼叫端
+    # 傳來的 language 挑對應語言版本——修的是「畫面切到英文模式，AI 出錯
+    # 時卻跳出中文訊息」這個語系不一致的問題。注意這跟「AI 自由回答的
+    # 內容本身要跟著問題語言走」是不同、更大的題目（Phase 8 原本設想但
+    # 還沒做的部分），這裡只處理這幾句固定字串。
     error_text = str(error)
     print(f"❌ Gemini request failed: {error_text}")
 
+    is_zh = language != "en"
+
     if "429" in error_text or "RESOURCE_EXHAUSTED" in error_text or "quota" in error_text.lower():
-        return "SugarTopia AI 目前使用量已達上限，請晚一點再試。"
+        return "SugarTopia AI 目前使用量已達上限，請晚一點再試。" if is_zh else "SugarTopia AI has reached its usage limit right now. Please try again later."
 
     if "API key" in error_text or "INVALID_ARGUMENT" in error_text:
-        return "SugarTopia AI 目前設定需要檢查，請稍後再試。"
+        return "SugarTopia AI 目前設定需要檢查，請稍後再試。" if is_zh else "SugarTopia AI's configuration needs to be checked. Please try again later."
 
-    return "SugarTopia AI 目前有點忙，請稍後再試。"
+    return "SugarTopia AI 目前有點忙，請稍後再試。" if is_zh else "SugarTopia AI is a bit busy right now. Please try again later."
 
 try:
     dessert_data = read_shop_data()
@@ -995,6 +1002,12 @@ app.add_middleware(
 
 class ChatRequest(BaseModel):
     message: str
+    # 前端目前的介面語言（"zh-TW" 或 "en"），用來決定這支 API 自己寫死的
+    # 固定回覆（額度用完、問題超出範圍……）要用哪個語言，不影響 Gemini
+    # 自由生成的回答內容本身（那部分是另一個更大的題目，見
+    # get_public_ai_error() 的註解）。預設 "zh-TW"，讓還沒更新過的舊版
+    # 前端（沒傳這個欄位）行為維持跟改之前一樣。
+    language: str = "zh-TW"
 
 class SignupRequest(BaseModel):
     name: str
@@ -2184,8 +2197,19 @@ def chat_with_gemini(request: ChatRequest):
         question_type = classify_question(request.message)
 
         if question_type == "out_of_scope":
+            # 這句罐頭回覆也是寫死的固定字串（不是 Gemini 生成的），跟
+            # get_public_ai_error() 一樣要跟著 request.language 走。
+            if request.language == "en":
+                reply = (
+                    "I'm the SugarTopia dessert assistant. I can help you find dessert shops, cafes, "
+                    "explain dessert types, or recommend a spot by area and situation. Try asking me: "
+                    "I want a matcha dessert, I'm looking for a cafe good for working, or what's the "
+                    "difference between pudding and panna cotta."
+                )
+            else:
+                reply = "我是 SugarTopia 甜點推薦助手，主要可以幫你找甜點店、咖啡廳、甜點種類介紹，或依照地區和情境推薦店家。你可以問我：想吃抹茶甜點、想找適合工作的咖啡廳，或布丁和奶酪有什麼差別。"
             return {
-                "reply": "我是 SugarTopia 甜點推薦助手，主要可以幫你找甜點店、咖啡廳、甜點種類介紹，或依照地區和情境推薦店家。你可以問我：想吃抹茶甜點、想找適合工作的咖啡廳，或布丁和奶酪有什麼差別。",
+                "reply": reply,
                 "type": question_type,
             }
 
@@ -2256,6 +2280,6 @@ def chat_with_gemini(request: ChatRequest):
         }
     except Exception as e:
         return {
-            "reply": get_public_ai_error(e),
+            "reply": get_public_ai_error(e, request.language),
             "type": "error",
         }
