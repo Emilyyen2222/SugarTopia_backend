@@ -244,6 +244,15 @@ def init_app_database():
         conn.execute("""
             ALTER TABLE curated_shops ADD COLUMN IF NOT EXISTS hours_zh TEXT NOT NULL DEFAULT '[]'
         """)
+        # 網站／電話：地址其實從一開始就有存（location／location_zh 欄位，
+        # 就是 Google 的 formattedAddress），只是店家詳情頁一直沒有真的顯示
+        # 出來，用的是頁面上寫死的假地址。這兩個是真的完全沒存過的新欄位。
+        conn.execute("""
+            ALTER TABLE curated_shops ADD COLUMN IF NOT EXISTS phone TEXT NOT NULL DEFAULT ''
+        """)
+        conn.execute("""
+            ALTER TABLE curated_shops ADD COLUMN IF NOT EXISTS website TEXT NOT NULL DEFAULT ''
+        """)
         # 首頁 hero 輪播圖，從 Pexels 抓來的甜點/咖啡照片快取——不是每個
         # 訪客進站都即時打一次 Pexels API（免費額度不夠用，也會拖慢首頁
         # 載入），而是後端啟動時抓一批存這裡，前端只讀這張表。
@@ -511,6 +520,8 @@ def normalize_curated_shop(row):
         "lng": row["lng"],
         "hours": json.loads(row["hours"] or "[]"),
         "hoursZh": json.loads(row["hours_zh"] or "[]"),
+        "phone": row["phone"] or "",
+        "website": row["website"] or "",
     }
 
 def load_curated_shops():
@@ -1937,7 +1948,7 @@ def add_curated_shop(request: CuratedShopRequest, authorization: str = Header(de
                 "X-Goog-Api-Key": GOOGLE_PLACES_API_KEY,
                 "X-Goog-FieldMask": (
                     "id,displayName,formattedAddress,rating,userRatingCount,"
-                    "googleMapsUri,location,photos"
+                    "googleMapsUri,location,photos,internationalPhoneNumber,websiteUri"
                 ),
             },
             timeout=10,
@@ -1983,9 +1994,9 @@ def add_curated_shop(request: CuratedShopRequest, authorization: str = Header(de
             INSERT INTO curated_shops (
                 id, name, name_zh, category, category_zh, location, location_zh,
                 rating, review_count, tags, tags_zh, description, image, lat, lng,
-                google_place_id, google_maps_url, created_at, hours, hours_zh
+                google_place_id, google_maps_url, created_at, hours, hours_zh, phone, website
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(google_place_id) DO NOTHING
             """,
             (
@@ -2009,6 +2020,8 @@ def add_curated_shop(request: CuratedShopRequest, authorization: str = Header(de
                 now,
                 json.dumps(hours, ensure_ascii=False),
                 json.dumps(hours_zh, ensure_ascii=False),
+                place.get("internationalPhoneNumber", ""),
+                place.get("websiteUri", ""),
             ),
         )
         conn.commit()
