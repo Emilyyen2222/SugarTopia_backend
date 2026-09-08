@@ -1020,6 +1020,9 @@ class LoginRequest(BaseModel):
 
 class ForgotPasswordRequest(BaseModel):
     email: str
+    # 跟 ChatRequest.language 同一個用途：讓寄出去的重設密碼信跟著使用者
+    # 當下的介面語言走，不要不管中英文模式都固定寄一封全英文的信。
+    language: str = "zh-TW"
 
 class ResetPasswordRequest(BaseModel):
     token: str
@@ -1249,16 +1252,23 @@ def forgot_password(request: ForgotPasswordRequest):
     if user is not None:
         token = create_password_reset_token(user["id"])
         reset_url = f"{FRONTEND_BASE_URL}/reset-password?token={quote(token)}"
-        send_email(
-            email,
-            "Reset your SugarTopia password",
-            f"""
+        if request.language == "en":
+            subject = "Reset your SugarTopia password"
+            html = f"""
             <p>Hi {user['name']},</p>
             <p>Someone requested a password reset for your SugarTopia account. If this was you, click the link below to set a new password. This link expires in {PASSWORD_RESET_TOKEN_MINUTES} minutes.</p>
             <p><a href="{reset_url}">{reset_url}</a></p>
             <p>If you didn't request this, you can safely ignore this email — your password won't be changed.</p>
-            """,
-        )
+            """
+        else:
+            subject = "重設你的 SugarTopia 密碼"
+            html = f"""
+            <p>嗨 {user['name']}，</p>
+            <p>有人（希望是你本人）申請重設你 SugarTopia 帳號的密碼。如果是你本人，請點下面的連結設定新密碼。這個連結 {PASSWORD_RESET_TOKEN_MINUTES} 分鐘後會失效。</p>
+            <p><a href="{reset_url}">{reset_url}</a></p>
+            <p>如果不是你本人申請的，可以直接忽略這封信，你的密碼不會被更改。</p>
+            """
+        send_email(email, subject, html)
 
     return {"message": FORGOT_PASSWORD_GENERIC_MESSAGE}
 
