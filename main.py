@@ -500,6 +500,7 @@ def normalize_shop(item):
         "locationZh": item["location"],
         "rating": item.get("rating", 0),
         "reviews": item.get("review_count", f"{len(item.get('reviews', []))} reviews"),
+        "reviewCount": len(item.get("reviews", [])),
         "tags": item.get("tags_en", item.get("tags", [])),
         "tagsZh": item.get("tags", []),
         "image": item.get("image", ""),
@@ -525,6 +526,11 @@ def normalize_curated_shop(row):
         "locationZh": row["location_zh"],
         "rating": row["rating"] or 0,
         "reviews": f"{row['review_count']} reviews" if row["review_count"] else "No reviews yet",
+        # reviews 是給畫面直接顯示用的字串（"123 reviews"），排序、比大小
+        # 都用不了。甜點人格測驗的配對要依「人氣」排店家，需要的是原始
+        # 數字，所以另外多開一個純數值欄位，不去動既有的 reviews 欄位
+        # （店家卡片、詳情頁都還在用它顯示文字）。
+        "reviewCount": row["review_count"] or 0,
         "tags": json.loads(row["tags"] or "[]"),
         "tagsZh": json.loads(row["tags_zh"] or "[]"),
         "image": row["image"] or "",
@@ -1454,6 +1460,109 @@ def get_shop(shop_id: str):
         raise HTTPException(status_code=404, detail="Shop not found.")
 
     return shop
+
+# ---------------------------------------------------------------------------
+# 甜點人格測驗（/quiz）的「人格 → 真實店家」配對
+# ---------------------------------------------------------------------------
+# 這裡刻意用「掛在店家本身的分類/特色標籤」（Cafes、Cat Cafe、Macaron……）
+# 來配對，而不是用測驗題目字面上講的情境（安靜、有插座、適合工作）。原因
+# 是那批情境標籤（REVIEW_CONTEXT_TAGS）是掛在「每一則評論」上的，要判斷
+# 「這家店安不安靜」得統計它底下所有評論——但目前真實評論量太少，大部分
+# 店家根本沒有足夠的評論可以判斷，硬做出來的配對會是假的。
+#
+# 分類標籤則是店家被收錄進資料庫的當下就填好的，102 家店現在全部都有，
+# 不用等任何資料累積。代價是語意上有落差：分類不完全等於情境（「咖啡廳」
+# 不保證「適合工作」），這是誠實的取捨，不是精準配對。
+#
+# 之後真實評論累積夠多，要升級成「用情境標籤統計配對」時，只要改這個
+# 檔案裡的 match_quiz_shops()，前端一行都不用動——這也是把配對邏輯放在
+# 後端、而不是散在前端的主要理由。
+QUIZ_PERSONAS = {
+    # 獨行厭世人：想要一個人待著。貓咖／被標成安靜的店最接近，再不夠就
+    # 補一般咖啡廳。排序用「評分高、但評論數少」——評論數少是「人比較少、
+    # 比較不吵」的代理指標，剛好跟下面「話題製造機」的排序相反。
+    "hermit": {"tags": ["Cat Cafe", "Quiet"], "backup_tags": ["Cafes"], "sort": "calm"},
+    # 續命依賴者：要久坐工作，咖啡廳是最接近的分類（插座、座位這種真正
+    # 該看的條件目前沒有店家層級的資料）。
+    "worker": {"tags": ["Cafes"], "backup_tags": [], "sort": "rating"},
+    # 外貌協會：看造型。馬卡龍、起司蛋糕、義式冰淇淋是外觀最上相的品類。
+    "visual": {"tags": ["Macaron", "Cheesecakes"], "backup_tags": ["Gelato"], "sort": "rating"},
+    # 話題製造機：追人氣、願意排隊。這一組是所有人格裡最誠實的——不靠
+    # 分類代理，直接用 Google 評論數（真的很多人去過）由多到少排。
+    "hype": {"tags": [], "backup_tags": [], "sort": "popular"},
+    # 情報中心：跟一群人邊吃邊聊。咖啡廳／毛孩友善都是適合待著聊天的店，
+    # 排序用人氣（熱鬧一點，跟獨行厭世人區隔開）。
+    "intel": {"tags": ["Cafes", "Dogs Friendly"], "backup_tags": [], "sort": "popular"},
+}
+
+QUIZ_SORT_KEYS = {
+    "rating": lambda shop: (-(shop.get("rating") or 0), -(shop.get("reviewCount") or 0)),
+    "popular": lambda shop: (-(shop.get("reviewCount") or 0), -(shop.get("rating") or 0)),
+    "calm": lambda shop: (-(shop.get("rating") or 0), shop.get("reviewCount") or 0),
+}
+
+def shops_with_any_tag(tags):
+    wanted = {tag.lower() for tag in tags}
+    return [
+        shop
+        for shop in shops
+        if wanted & {tag.lower() for tag in shop.get("tags", [])}
+    ]
+
+def match_quiz_shops(persona_key, limit):
+    persona = QUIZ_PERSONAS[persona_key]
+    sort_key = QUIZ_SORT_KEYS[persona["sort"]]
+
+    # 三層來源依序往下補，直到湊滿 limit 家：主要標籤 → 備援標籤 → 全部
+    # 店家。最後一層是為了保證「測完一定有店可看」——寧可配對得寬鬆一點，
+    # 也不要讓使用者測完看到空白結果（尤其貓咖只有 2 家、Quiet 只有 1 家，
+    # 光靠主要標籤湊不滿 3 家是常態，不是例外）。
+    picked = []
+    seen = set()
+
+    for pool in (
+        shops_with_any_tag(persona["tags"]) if persona["tags"] else [],
+        shops_with_any_tag(persona["backup_tags"]) if persona["backup_tags"] else [],
+        shops,
+    ):
+        for shop in sorted(pool, key=sort_key):
+            if len(picked) >= limit:
+                break
+            if shop["id"] in seen:
+                continue
+            seen.add(shop["id"])
+            # 複製一份再加欄位，不要直接改到 shops 裡的原始字典——那是全域
+            # 共用的資料，被塞進測驗專用欄位之後，其他 API（店家列表、詳情頁）
+            # 也會跟著回傳這個欄位。
+            matched = [
+                tag
+                for tag in shop.get("tags", [])
+                if tag.lower() in {t.lower() for t in persona["tags"] + persona["backup_tags"]}
+            ]
+            picked.append({**shop, "matchedTags": matched})
+
+        if len(picked) >= limit:
+            break
+
+    return picked
+
+@app.get("/api/quiz/match")
+def get_quiz_match(persona: str = "", limit: int = 3):
+    persona_key = (persona or "").strip().lower()
+    if persona_key not in QUIZ_PERSONAS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unknown persona. Expected one of: {', '.join(sorted(QUIZ_PERSONAS))}",
+        )
+
+    # 上限鎖在 10：這支 API 是給測驗結果頁配 3 家店用的，不是拿來當店家
+    # 列表的另一個入口（那是 GET /api/shops 的工作）。
+    safe_limit = max(1, min(limit, 10))
+
+    return {
+        "persona": persona_key,
+        "shops": match_quiz_shops(persona_key, safe_limit),
+    }
 
 @app.get("/api/favorites")
 def get_favorites(authorization: str = Header(default="")):
