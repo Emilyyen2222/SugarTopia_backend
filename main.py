@@ -208,6 +208,23 @@ def init_app_database():
                 FOREIGN KEY (review_id) REFERENCES reviews(id)
             )
         """)
+        # 店家層級的使用者投稿照片（跟評論照片是兩件事——這個不綁在某一則
+        # 評論下面，是任何登入的人都可以幫這家店的相簿加照片，類似 Google
+        # Maps「新增相片」的概念）。shop_id 沒有設外鍵，跟 reviews.shop_id
+        # 是同樣的考量：店家資料來源不只 curated_shops 一種（歷史上還有
+        # dessert_data_sample.json 那批示意店家），用外鍵綁死反而會擋掉
+        # 合法情況。
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS shop_photos (
+                id SERIAL PRIMARY KEY,
+                shop_id TEXT NOT NULL,
+                user_id INTEGER NOT NULL,
+                photo_data BYTEA NOT NULL,
+                content_type TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                FOREIGN KEY (user_id) REFERENCES users(id)
+            )
+        """)
         conn.execute("""
             CREATE TABLE IF NOT EXISTS curated_shops (
                 id TEXT PRIMARY KEY,
@@ -1664,18 +1681,19 @@ def delete_review(review_id: int, authorization: str = Header(default="")):
 # 又重（Postgres 也不是設計來放大量圖片的地方，見上面 review_photos
 # 表的取捨說明）。
 REVIEW_PHOTOS_MAX_PER_REVIEW = 4
-REVIEW_PHOTO_MAX_UPLOAD_BYTES = 5 * 1024 * 1024
-# 跟大頭貼的正方形裁切不一樣：評論照片是使用者實際拍的甜點/店內照，硬裁
-# 成正方形會裁掉重要內容，這裡改成「等比例縮小，最長邊不超過
-# REVIEW_PHOTO_MAX_DIMENSION」，維持原始長寬比例。
-REVIEW_PHOTO_MAX_DIMENSION = 1600
+PHOTO_MAX_UPLOAD_BYTES = 5 * 1024 * 1024
+# 跟大頭貼的正方形裁切不一樣：這裡的照片是使用者實際拍的甜點/店內照，硬裁
+# 成正方形會裁掉重要內容，改成「等比例縮小，最長邊不超過 PHOTO_MAX_DIMENSION」，
+# 維持原始長寬比例。評論照片、店家投稿照片（shop_photos，見下面
+# upload_shop_photo()）共用同一套處理，不是只有評論在用。
+PHOTO_MAX_DIMENSION = 1600
 
-def process_review_photo_upload(raw_bytes):
-    # 抽成共用函式，因為 upload_review_photos() 要對「多個檔案」各自做
-    # 同一套處理（驗證＋解碼＋縮圖＋轉 JPEG bytes），不要每個檔案重複寫
-    # 一次一樣的邏輯。回傳處理好的 JPEG bytes；檔案本身有問題（不是圖片、
-    # 太大）會拋 HTTPException，呼叫端不用另外檢查回傳值是否為 None。
-    if len(raw_bytes) > REVIEW_PHOTO_MAX_UPLOAD_BYTES:
+def process_photo_upload(raw_bytes):
+    # 抽成共用函式，因為每個上傳照片的端點都要對「多個檔案」各自做同一套
+    # 處理（驗證＋解碼＋縮圖＋轉 JPEG bytes），不要每個端點重複寫一次一樣
+    # 的邏輯。回傳處理好的 JPEG bytes；檔案本身有問題（不是圖片、太大）
+    # 會拋 HTTPException，呼叫端不用另外檢查回傳值是否為 None。
+    if len(raw_bytes) > PHOTO_MAX_UPLOAD_BYTES:
         raise HTTPException(status_code=400, detail="Image is too large (max 5MB).")
 
     try:
@@ -1687,8 +1705,8 @@ def process_review_photo_upload(raw_bytes):
     image = image.convert("RGB")
     width, height = image.size
     longest_side = max(width, height)
-    if longest_side > REVIEW_PHOTO_MAX_DIMENSION:
-        scale = REVIEW_PHOTO_MAX_DIMENSION / longest_side
+    if longest_side > PHOTO_MAX_DIMENSION:
+        scale = PHOTO_MAX_DIMENSION / longest_side
         image = image.resize((round(width * scale), round(height * scale)), Image.LANCZOS)
 
     buffer = io.BytesIO()
@@ -1725,8 +1743,8 @@ def upload_review_photos(review_id: int, authorization: str = Header(default="")
             if not (upload.content_type or "").startswith("image/"):
                 raise HTTPException(status_code=400, detail="All files must be images.")
 
-            raw_bytes = upload.file.read(REVIEW_PHOTO_MAX_UPLOAD_BYTES + 1)
-            photo_bytes = process_review_photo_upload(raw_bytes)
+            raw_bytes = upload.file.read(PHOTO_MAX_UPLOAD_BYTES + 1)
+            photo_bytes = process_photo_upload(raw_bytes)
 
             conn.execute(
                 """
@@ -1780,6 +1798,125 @@ def delete_review_photo(review_id: int, photo_id: int, authorization: str = Head
 
     photos_map = get_review_photos_map([review_id])
     return {"photos": photos_map.get(review_id, [])}
+
+# 店家層級的投稿照片（不綁在某一則評論下面，任何登入的人都可以幫這家店
+# 的相簿加照片）。上限比評論照片（4 張）寬鬆很多——這裡的性質比較像
+# 「大家一起貢獻的相簿」，不是單則評論的輔助佐證，但還是要有個上限，
+# 不能真的無限長下去。
+SHOP_PHOTOS_MAX_PER_SHOP = 20
+
+def shop_photo_url(shop_id, photo_id):
+    return f"{PUBLIC_BASE_URL}/api/shops/{quote(shop_id, safe='')}/photos/{photo_id}"
+
+@app.post("/api/shops/{shop_id}/photos")
+def upload_shop_photos(shop_id: str, authorization: str = Header(default=""), files: list[UploadFile] = File(...)):
+    user = require_current_user(authorization)
+
+    if find_shop(shop_id) is None:
+        raise HTTPException(status_code=404, detail="Shop not found.")
+
+    with get_db_connection() as conn:
+        existing_count = conn.execute(
+            "SELECT COUNT(*) AS count FROM shop_photos WHERE shop_id = ?", (shop_id,)
+        ).fetchone()["count"]
+
+        if existing_count + len(files) > SHOP_PHOTOS_MAX_PER_SHOP:
+            raise HTTPException(
+                status_code=400,
+                detail=f"A shop can have at most {SHOP_PHOTOS_MAX_PER_SHOP} photos.",
+            )
+
+        now = datetime.now(timezone.utc).isoformat()
+        for upload in files:
+            if not (upload.content_type or "").startswith("image/"):
+                raise HTTPException(status_code=400, detail="All files must be images.")
+
+            raw_bytes = upload.file.read(PHOTO_MAX_UPLOAD_BYTES + 1)
+            photo_bytes = process_photo_upload(raw_bytes)
+
+            conn.execute(
+                """
+                INSERT INTO shop_photos (shop_id, user_id, photo_data, content_type, created_at)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (shop_id, user["id"], psycopg2.Binary(photo_bytes), "image/jpeg", now),
+            )
+        conn.commit()
+
+    return get_shop_photos(shop_id)
+
+@app.get("/api/shops/{shop_id}/photos")
+def get_shop_photos(shop_id: str):
+    # 公開端點，不用登入——店家相簿是給每個訪客看的展示內容。
+    with get_db_connection() as conn:
+        rows = conn.execute(
+            """
+            SELECT shop_photos.id, shop_photos.user_id, shop_photos.created_at, users.name
+            FROM shop_photos
+            JOIN users ON users.id = shop_photos.user_id
+            WHERE shop_photos.shop_id = ?
+            ORDER BY shop_photos.created_at DESC
+            """,
+            (shop_id,),
+        ).fetchall()
+
+    return {
+        "photos": [
+            {
+                "id": row["id"],
+                "url": shop_photo_url(shop_id, row["id"]),
+                "uploaderName": row["name"],
+                # 前端要知道「這張是不是我上傳的」才能決定要不要顯示刪除
+                # 按鈕——比對 uploaderId（不是 uploaderName）才不會因為兩個
+                # 使用者剛好取同一個顯示名稱，就誤判成同一個人、顯示出不該
+                # 出現的刪除按鈕（後端本來就會用真正的 user_id 擋非本人，
+                # 這裡只是不要讓按鈕一開始就顯示錯）。
+                "uploaderId": row["user_id"],
+                "createdAt": row["created_at"],
+            }
+            for row in rows
+        ]
+    }
+
+@app.get("/api/shops/{shop_id}/photos/{photo_id}")
+def get_shop_photo(shop_id: str, photo_id: int):
+    with get_db_connection() as conn:
+        row = conn.execute(
+            "SELECT photo_data, content_type FROM shop_photos WHERE id = ? AND shop_id = ?",
+            (photo_id, shop_id),
+        ).fetchone()
+
+    if row is None:
+        raise HTTPException(status_code=404, detail="Photo not found.")
+
+    return Response(
+        content=bytes(row["photo_data"]),
+        media_type=row["content_type"] or "image/jpeg",
+        headers={"Cache-Control": "public, max-age=31536000, immutable"},
+    )
+
+@app.delete("/api/shops/{shop_id}/photos/{photo_id}")
+def delete_shop_photo(shop_id: str, photo_id: int, authorization: str = Header(default="")):
+    user = require_current_user(authorization)
+
+    with get_db_connection() as conn:
+        photo = conn.execute(
+            "SELECT user_id FROM shop_photos WHERE id = ? AND shop_id = ?", (photo_id, shop_id)
+        ).fetchone()
+
+        if photo is None:
+            raise HTTPException(status_code=404, detail="Photo not found.")
+
+        # 只有當初上傳的人能刪自己貢獻的照片——這是使用者投稿內容，跟
+        # 評論照片「只有評論作者能刪」是同一個原則，不開放任何登入使用者
+        # 刪別人上傳的照片。
+        if photo["user_id"] != user["id"]:
+            raise HTTPException(status_code=403, detail="You can only delete photos you uploaded.")
+
+        conn.execute("DELETE FROM shop_photos WHERE id = ? AND shop_id = ?", (photo_id, shop_id))
+        conn.commit()
+
+    return get_shop_photos(shop_id)
 
 @app.get("/api/reviews/latest")
 def get_latest_reviews(limit: int = 8):
