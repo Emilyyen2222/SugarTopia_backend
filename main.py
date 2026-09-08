@@ -1135,6 +1135,12 @@ class CuratedShopRequest(BaseModel):
     tags: list[str] = []
     tags_zh: list[str] = []
 
+class UpdateCuratedShopRequest(BaseModel):
+    category: str = ""
+    category_zh: str = ""
+    tags: list[str] = []
+    tags_zh: list[str] = []
+
 @app.get("/")
 def read_root():
     return {
@@ -2194,6 +2200,51 @@ def add_curated_shop(request: CuratedShopRequest, authorization: str = Header(de
     add_shop_to_vector_db(new_shop)
 
     return {"message": "Shop added to SugarTopia.", "shop": new_shop}
+
+@app.put("/api/shops/curated/{shop_id}")
+def update_curated_shop(shop_id: str, request: UpdateCuratedShopRequest, authorization: str = Header(default="")):
+    require_admin_user(authorization)
+
+    with get_db_connection() as conn:
+        existing = conn.execute("SELECT id FROM curated_shops WHERE id = ?", (shop_id,)).fetchone()
+
+        if existing is None:
+            raise HTTPException(status_code=404, detail="Shop not found.")
+
+        conn.execute(
+            """
+            UPDATE curated_shops
+            SET category = ?, category_zh = ?, tags = ?, tags_zh = ?
+            WHERE id = ?
+            """,
+            (
+                request.category,
+                request.category_zh,
+                json.dumps(request.tags, ensure_ascii=False),
+                json.dumps(request.tags_zh, ensure_ascii=False),
+                shop_id,
+            ),
+        )
+        conn.commit()
+        row = conn.execute("SELECT * FROM curated_shops WHERE id = ?", (shop_id,)).fetchone()
+
+    updated_shop = normalize_curated_shop(row)
+
+    # 更新記憶體裡那份 shops 清單，跟新增店家時 shops.append() 是同一個
+    # 「後端啟動時整批讀進記憶體、之後有異動就要手動同步」的模式（見
+    # add_shop_to_vector_db() 的註解）。找到同一個 id 的項目原地替換掉。
+    #
+    # 已知限制：這裡沒有同步更新 AI 向量資料庫——add_shop_to_vector_db()
+    # 只支援「新增一筆」，Chroma 沒有現成的「用內容找到對應那筆、原地
+    # 更新」機制（要做到的話得另外追蹤每家店對應哪個向量 id）。實務影響
+    # 有限：分類／標籤這種編輯通常是修正資料而不是徹底改變這家店是什麼，
+    # AI 問答繼續用編輯前的舊標籤描述，不是等到下次重新部署就會自動跟上。
+    for index, shop in enumerate(shops):
+        if shop["id"] == shop_id:
+            shops[index] = updated_shop
+            break
+
+    return {"message": "Shop updated.", "shop": updated_shop}
 
 @app.post("/api/chat")
 def chat_with_gemini(request: ChatRequest):
