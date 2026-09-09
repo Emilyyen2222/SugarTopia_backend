@@ -569,38 +569,52 @@ def load_curated_shops():
 # 和菓子/麻糬/抹茶甜點這類主題圖，不是隨便沾邊的照片（例如 "japanese
 # dessert"、"mochi"、"japanese bakery" 這幾個詞組實測會混進壽司卷、
 # 一般麵包架這種不相關的結果，所以沒有採用）。
-PEXELS_HERO_QUERIES = ["wagashi", "mochi dessert", "matcha dessert", "dango", "matcha cafe"]
+#
+# 再後來（2026-09）連關鍵字搜尋這個做法本身也被放棄了：每次後端重開機
+# 用關鍵字重新搜尋、拿排序最前面的幾張直接上架，中間完全沒有人工審過，
+# 賭運氣賭到不少構圖普通、角度怪的照片，使用者實際看過後嫌醜。改成
+# Emily 自己在 Pexels 上手動挑好、確認喜歡的固定 9 張（photo id 是從
+# 她貼的 Pexels 頁面網址 https://www.pexels.com/.../<id>/ 取出來的），
+# 不再做關鍵字搜尋——圖片品質變成人工把關，不是 API 抽籤。
+#
+# 這批圖也順便修掉一個手機版「圖片被切到」的問題：舊版存的是 Pexels
+# `src.landscape`（預先裁成寬扁 1200×627 的橫幅比例），手機版輪播圖
+# 容器卻是又窄又高（接近全螢幕高），等於裁了兩次（Pexels 先裁一次，
+# 前端 object-fit: cover 又裁一次塞進窄高容器），主體常被裁掉一大半。
+# 這批手動挑的圖大多本來就是直式構圖（例如 3024×4032），改存
+# `src.large`（保留原始比例，不預先裁切）之後，前端裁切幅度小很多。
+PEXELS_HERO_PHOTO_IDS = [
+    "13610948", "34334882", "8474082", "20130929", "23877482",
+    "9050512", "2253643", "14399249", "12131071",
+]
 
 def refresh_hero_photos():
     # 跟向量資料庫、curated_shops 一樣的取捨：只在後端啟動時抓一次，
-    # 不是即時抓、也沒有排程定期更新——Pexels 免費額度不高，這個是
-    # 「刻意先簡單做」的版本，之後如果想做到真的每天自動換一批，可以
-    # 加 Cloud Scheduler 定期打一支後端的刷新端點，而不是現在這種
-    # 每次開機才換的做法。任何失敗（key 沒設定、API 打不通、額度用完）
-    # 都不拋例外——首頁輪播圖抓不到新照片，不該連帶讓整個後端開機失敗。
+    # 不是即時抓、也沒有排程定期更新。任何失敗（key 沒設定、API 打不通、
+    # 額度用完、某張圖被下架）都不拋例外、也不影響其他張——首頁輪播圖
+    # 抓不到新照片，不該連帶讓整個後端開機失敗。
     if not PEXELS_API_KEY:
         print("⚠️ 沒有設定 PEXELS_API_KEY，首頁 hero 輪播圖沿用前端本地圖片。")
         return
 
     photos = []
-    for query in PEXELS_HERO_QUERIES:
+    for photo_id in PEXELS_HERO_PHOTO_IDS:
         try:
             response = requests.get(
-                "https://api.pexels.com/v1/search",
+                f"https://api.pexels.com/v1/photos/{photo_id}",
                 headers={"Authorization": PEXELS_API_KEY},
-                params={"query": query, "per_page": 2},
                 timeout=10,
             )
             response.raise_for_status()
-            for photo in response.json().get("photos", []):
-                photos.append({
-                    "url": photo["src"]["landscape"],
-                    "photographer": photo.get("photographer", ""),
-                    "photographer_url": photo.get("photographer_url", ""),
-                    "pexels_url": photo.get("url", ""),
-                })
+            photo = response.json()
+            photos.append({
+                "url": photo["src"]["large"],
+                "photographer": photo.get("photographer", ""),
+                "photographer_url": photo.get("photographer_url", ""),
+                "pexels_url": photo.get("url", ""),
+            })
         except Exception as e:
-            print(f"⚠️ Pexels 搜尋「{query}」失敗，跳過這個關鍵字：{e}")
+            print(f"⚠️ Pexels 照片 id={photo_id} 抓取失敗，跳過：{e}")
 
     if not photos:
         print("⚠️ Pexels 一張照片都沒抓到，首頁 hero 輪播圖沿用前端本地圖片。")
@@ -621,7 +635,7 @@ def refresh_hero_photos():
             )
         conn.commit()
 
-    print(f"✅ 首頁 hero 輪播圖已更新，共 {len(photos)} 張（來自 Pexels）。")
+    print(f"✅ 首頁 hero 輪播圖已更新，共 {len(photos)} 張（來自 Pexels，Emily 手動挑選）。")
 
 def get_search_text(shop):
     values = [
